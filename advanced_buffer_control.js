@@ -1,409 +1,777 @@
-/**
- * ╔══════════════════════════════════════════════════════════════╗
- * ║         Advanced Buffer Control — «Умный большой буфер»     ║
- * ║         Плагин для Lampa (Android / Android TV)             ║
- * ║         Версия: 1.2.0                                       ║
- * ║         Совместимость: Lampa 2025–2026                      ║
- * ╚══════════════════════════════════════════════════════════════╝
+/*
+ * Advanced Buffer Control / Умный большой буфер
+ * Версия: 1.0.0
  *
- * Установка: Lampa → Настройки → Расширения → Добавить плагин
+ * Плагин для Lampa:
+ * - добавляет настройку размера буфера в меню настроек;
+ * - при каждом запуске видео применяет выбранный размер буфера;
+ * - работает с нативным <video> и с hls.js;
+ * - при малом остатке буфера принудительно инициирует дальнейшую загрузку.
  */
-
 (function () {
     'use strict';
 
-    /* ─── Константы плагина ─────────────────────────────────── */
-    var PLUGIN_NAME    = 'AdvancedBufferControl';
-    var PLUGIN_VERSION = '1.2.0';
-    var STORAGE_KEY    = 'adv_buffer_minutes';   // ключ в Lampa.Storage
-    var DEFAULT_MINS   = 20;                      // значение по умолчанию (минут)
-    var CHECK_INTERVAL = 5000;                    // интервал проверки буфера (мс)
-    /** Порог остатка буфера: если впереди осталось меньше N секунд — начать подгрузку */
-    var LOW_BUFFER_THRESHOLD = 50;               // секунд
+    console.log('[Advanced Buffer Control] v1.0.0: file begin');
 
-    console.log('[' + PLUGIN_NAME + '] v' + PLUGIN_VERSION + ' — загрузка...');
+    // Защита от повторной инициализации, если файл был загружен несколько раз.
+    if (window.advanced_buffer_control_plugin_ready) {
+        console.log('[Advanced Buffer Control] v1.0.0: already initialized');
+        console.log('[Advanced Buffer Control] v1.0.0: file end');
+        return;
+    }
 
-    /* ─── Внутреннее состояние плагина ──────────────────────── */
-    var state = {
-        intervalId   : null,   // ID таймера мониторинга
-        video        : null,   // ссылка на текущий <video>
-        hls          : null,   // ссылка на текущий hls.js-экземпляр
-        isLoading    : false,  // флаг: идёт ли принудительная подгрузка
-        lastSeekTime : 0,      // метка времени последнего «форсированного» seek
-        destroyed    : false   // флаг: плеер уже уничтожен
+    window.advanced_buffer_control_plugin_ready = true;
+
+    // Базовые константы плагина.
+    var PLUGIN_NAME = 'Advanced Buffer Control';
+    var PLUGIN_TITLE = 'Умный большой буфер';
+    var PLUGIN_VERSION = '1.0.0';
+    var STORAGE_KEY = 'advanced_buffer_control_minutes';
+    var DEFAULT_MINUTES = '20';
+    var LOW_BUFFER_THRESHOLD = 55;
+    var HLS_FORCE_COOLDOWN = 8000;
+    var NATIVE_FORCE_COOLDOWN = 12000;
+    var WATCHDOG_INTERVAL = 2000;
+
+    // Разрешённые значения буфера в минутах.
+    var BUFFER_OPTIONS = {
+        '5': '5 минут',
+        '10': '10 минут',
+        '15': '15 минут',
+        '20': '20 минут',
+        '25': '25 минут',
+        '30': '30 минут',
+        '35': '35 минут',
+        '40': '40 минут'
     };
 
-    /* ─── Вспомогательные функции ───────────────────────────── */
+    // Общий runtime-state плагина.
+    var state = {
+        hlsPatched: false,
+        lastHls: null,
+        currentSession: null
+    };
 
-    /**
-     * Получить выбранный пользователем размер буфера в МИНУТАХ.
-     * Если значение ещё не установлено — вернуть DEFAULT_MINS.
-     */
-    function getBufferMinutes() {
-        var val = Lampa.Storage.get(STORAGE_KEY);
-        var num = parseInt(val, 10);
-        if (isNaN(num) || num <= 0) return DEFAULT_MINS;
-        return Math.min(num, 40); // никогда не превышать 40 минут
+    // Короткий логгер, чтобы все сообщения плагина было легко отфильтровать в консоли.
+    function log() {
+        var args = Array.prototype.slice.call(arguments);
+        args.unshift('[Advanced Buffer Control]');
+        console.log.apply(console, args);
     }
 
-    /** Перевод минут в секунды */
-    function toSec(mins) {
-        return mins * 60;
+    // Предупреждения держим отдельно, чтобы ошибки было проще заметить.
+    function warn() {
+        var args = Array.prototype.slice.call(arguments);
+        args.unshift('[Advanced Buffer Control]');
+        console.warn.apply(console, args);
     }
 
-    /**
-     * Определить, сколько секунд видео уже буферизировано
-     * ВПЕРЁД от текущей позиции воспроизведения.
-     * Проходим по диапазонам video.buffered и ищем диапазон,
-     * содержащий currentTime.
-     */
-    function getBufferedAhead(video) {
-        if (!video || !video.buffered || video.buffered.length === 0) return 0;
-        var ct = video.currentTime;
-        for (var i = 0; i < video.buffered.length; i++) {
-            var start = video.buffered.start(i);
-            var end   = video.buffered.end(i);
-            if (ct >= start - 0.5 && ct <= end) {
-                return end - ct; // секунды буфера впереди
+    // Простейший аналог Object.assign для большей совместимости со старыми движками.
+    function extend(target) {
+        var i;
+        var source;
+        var key;
+
+        target = target || {};
+
+        for (i = 1; i < arguments.length; i++) {
+            source = arguments[i] || {};
+
+            for (key in source) {
+                if (Object.prototype.hasOwnProperty.call(source, key)) {
+                    target[key] = source[key];
+                }
             }
         }
-        return 0;
+
+        return target;
     }
 
-    /**
-     * Применить настройки буфера к экземпляру hls.js.
-     * Устанавливаем maxBufferLength и maxMaxBufferLength
-     * в соответствии с выбранным пользователем значением.
-     */
-    function applyHlsConfig(hls, bufSec) {
-        if (!hls || !hls.config) return;
+    // Надёжно приводим значение к числу, иначе возвращаем запасное значение.
+    function toNumber(value, fallback) {
+        var num = parseFloat(value);
+        return isFinite(num) ? num : fallback;
+    }
+
+    // Возвращаем выбранное пользователем количество минут и жёстко ограничиваем диапазон 5..40.
+    function getSelectedMinutes() {
+        var raw = (Lampa && Lampa.Storage ? Lampa.Storage.get(STORAGE_KEY, DEFAULT_MINUTES) : DEFAULT_MINUTES) + '';
+        var minutes = toNumber(raw, toNumber(DEFAULT_MINUTES, 20));
+
+        if (minutes < 5) minutes = 5;
+        if (minutes > 40) minutes = 40;
+
+        // Разрешаем только шаги по 5 минутам, чтобы настройка не уходила в неожиданные значения.
+        minutes = Math.round(minutes / 5) * 5;
+
+        if (!BUFFER_OPTIONS[String(minutes)]) minutes = 20;
+
+        return minutes;
+    }
+
+    // Основной целевой размер буфера в секундах.
+    function getTargetBufferSeconds() {
+        return getSelectedMinutes() * 60;
+    }
+
+    // Для hls.js нужен ещё и лимит по байтам.
+    // Формула намеренно даёт довольно высокий потолок, чтобы не упираться в стандартные 60 MB,
+    // но при этом не уходит в совсем экстремальные значения.
+    function getTargetBufferBytes(seconds) {
+        var minBytes = 150 * 1024 * 1024;
+        var maxBytes = 1600 * 1024 * 1024;
+        var estimated = Math.round(seconds * 700000);
+
+        if (estimated < minBytes) estimated = minBytes;
+        if (estimated > maxBytes) estimated = maxBytes;
+
+        return estimated;
+    }
+
+    // Инициализируем дефолтное значение, если пользователь ещё ни разу не открывал настройку.
+    function ensureDefaultValue() {
         try {
-            hls.config.maxBufferLength    = bufSec;
-            hls.config.maxMaxBufferLength = bufSec;
-            // maxBufferSize — в байтах; примерно 500 КБ на секунду 1080p HLS
-            hls.config.maxBufferSize = bufSec * 500 * 1024;
-            console.log('[' + PLUGIN_NAME + '] hls.config обновлён: maxBufferLength=' + bufSec + 'с');
-        } catch (e) {
-            console.warn('[' + PLUGIN_NAME + '] Ошибка применения hls.config:', e);
-        }
-    }
+            var value = Lampa.Storage.get(STORAGE_KEY, null);
 
-    /**
-     * Принудительно запустить подгрузку через hls.js.
-     * hls.startLoad(currentTime) заставляет hls.js начать/продолжить
-     * загрузку сегментов начиная с указанной позиции.
-     */
-    function forceHlsLoad(hls, video) {
-        if (!hls || !video) return;
-        try {
-            hls.startLoad(video.currentTime);
-            console.log('[' + PLUGIN_NAME + '] hls.startLoad() вызван для подгрузки буфера');
-        } catch (e) {
-            console.warn('[' + PLUGIN_NAME + '] Ошибка hls.startLoad():', e);
-        }
-    }
-
-    /**
-     * Форсированная подгрузка для нативного <video> (без hls.js).
-     * Делаем «призрачный» seek: чуть вперёд, затем обратно.
-     * Это вынуждает браузер/WebView начать буферизацию вперёд.
-     * Throttle: не чаще чем раз в 3 секунды, чтобы не спамить.
-     */
-    function forceNativeLoad(video) {
-        if (!video) return;
-        var now = Date.now();
-        if (now - state.lastSeekTime < 3000) return; // throttle
-        state.lastSeekTime = now;
-
-        var ct = video.currentTime;
-        var probePos = ct + 2; // seek на 2 секунды вперёд
-        if (probePos >= (video.duration || Infinity)) return;
-
-        var paused = video.paused;
-        try {
-            video.currentTime = probePos;
-            // Немедленно возвращаемся обратно
-            setTimeout(function () {
-                if (video && !state.destroyed) {
-                    video.currentTime = ct;
-                    if (!paused) video.play().catch(function () {});
-                }
-            }, 50);
-            console.log('[' + PLUGIN_NAME + '] Native seek-probe выполнен для подгрузки');
-        } catch (e) {
-            console.warn('[' + PLUGIN_NAME + '] Ошибка native seek-probe:', e);
-        }
-    }
-
-    /* ─── Основной цикл мониторинга буфера ─────────────────── */
-
-    /**
-     * Периодически проверяет состояние буфера.
-     * Если буфера впереди меньше LOW_BUFFER_THRESHOLD секунд
-     * и видео ещё не закончилось — запускает подгрузку.
-     */
-    function startMonitoring() {
-        stopMonitoring(); // сначала сбросить предыдущий таймер
-
-        state.intervalId = setInterval(function () {
-            // Проверки безопасности
-            if (state.destroyed) {
-                stopMonitoring();
-                return;
+            if (value === null || value === undefined || value === '') {
+                Lampa.Storage.set(STORAGE_KEY, DEFAULT_MINUTES);
             }
-
-            var video = state.video;
-            var hls   = state.hls;
-
-            if (!video) return;
-
-            // Если видео уже закончилось — ничего не делаем
-            var duration = video.duration || 0;
-            if (duration > 0 && video.currentTime >= duration - 1) return;
-
-            var bufferedAhead = getBufferedAhead(video);
-            var bufferTarget  = toSec(getBufferMinutes());
-
-            console.log('[' + PLUGIN_NAME + '] Буфер впереди: ' +
-                Math.round(bufferedAhead) + 'с / цель: ' + bufferTarget + 'с');
-
-            // Если буфера впереди меньше порогового значения — подгружаем
-            if (bufferedAhead < LOW_BUFFER_THRESHOLD) {
-                if (hls) {
-                    // Для hls.js: убеждаемся, что конфиг актуален, и запускаем загрузку
-                    applyHlsConfig(hls, bufferTarget);
-                    forceHlsLoad(hls, video);
-                } else {
-                    // Для нативного видео: делаем seek-probe
-                    forceNativeLoad(video);
-                }
-            } else if (hls && bufferedAhead < bufferTarget - 10) {
-                // Буфер есть, но до целевого значения ещё далеко —
-                // убеждаемся, что hls.js знает о нашем лимите и продолжает грузить
-                applyHlsConfig(hls, bufferTarget);
-                forceHlsLoad(hls, video);
-            }
-
-        }, CHECK_INTERVAL);
-
-        console.log('[' + PLUGIN_NAME + '] Мониторинг буфера запущен (интервал ' + CHECK_INTERVAL + 'мс)');
-    }
-
-    /** Остановить таймер мониторинга */
-    function stopMonitoring() {
-        if (state.intervalId !== null) {
-            clearInterval(state.intervalId);
-            state.intervalId = null;
-            console.log('[' + PLUGIN_NAME + '] Мониторинг буфера остановлен');
+        } catch (e) {
+            warn('failed to initialize default setting', e);
         }
     }
 
-    /* ─── Инициализация для конкретного запуска видео ────────── */
-
-    /**
-     * Вызывается, когда плеер Lampa открыл видео.
-     * Ищем <video> и hls-экземпляр, применяем начальную конфигурацию
-     * и запускаем мониторинг.
-     */
-    function onPlayerReady() {
-        // Сброс предыдущего состояния
-        destroySession();
-
-        state.destroyed = false;
-
-        var bufSec = toSec(getBufferMinutes());
-
-        // ── 1. Получить ссылку на <video> элемент ──
-        // Lampa обычно создаёт один <video> на всю страницу
-        state.video = document.querySelector('video');
-
-        if (!state.video) {
-            // Подождём немного — плеер мог ещё не вставить элемент в DOM
-            setTimeout(function () {
-                state.video = document.querySelector('video');
-                if (state.video) {
-                    initSession(bufSec);
-                } else {
-                    console.warn('[' + PLUGIN_NAME + '] <video> не найден, пропуск сессии');
-                }
-            }, 1500);
-            return;
-        }
-
-        initSession(bufSec);
-    }
-
-    /**
-     * Финальная инициализация после того, как <video> найден.
-     */
-    function initSession(bufSec) {
-        // ── 2. Получить hls.js (если используется) ──
-        // Lampa хранит hls-экземпляр в window.hls или внутри объекта плеера
-        state.hls = window.hls || null;
-
-        // Дополнительная попытка найти hls через Lampa.Player
-        if (!state.hls) {
-            try {
-                var lp = Lampa.Player;
-                if (lp && lp.hls) state.hls = lp.hls;
-            } catch (e) { /* нет доступа — ничего страшного */ }
-        }
-
-        if (state.hls) {
-            console.log('[' + PLUGIN_NAME + '] Обнаружен hls.js, применяем конфиг буфера');
-            applyHlsConfig(state.hls, bufSec);
-        } else {
-            console.log('[' + PLUGIN_NAME + '] hls.js не обнаружен, используем нативный <video>');
-        }
-
-        // ── 3. Слушаем событие 'canplay' — к этому моменту видео точно готово ──
-        state.video.addEventListener('canplay', onVideoCanPlay, { once: true });
-
-        // ── 4. Запускаем периодический мониторинг ──
-        startMonitoring();
-    }
-
-    /**
-     * Видео готово к воспроизведению — принудительно запускаем первую подгрузку.
-     */
-    function onVideoCanPlay() {
-        console.log('[' + PLUGIN_NAME + '] canplay: запуск первоначальной подгрузки');
-        var bufSec = toSec(getBufferMinutes());
-        if (state.hls) {
-            applyHlsConfig(state.hls, bufSec);
-            forceHlsLoad(state.hls, state.video);
-        }
-    }
-
-    /**
-     * Завершить текущую сессию: остановить мониторинг, очистить ссылки.
-     */
-    function destroySession() {
-        state.destroyed = true;
-        stopMonitoring();
-        state.video      = null;
-        state.hls        = null;
-        state.isLoading  = false;
-        state.lastSeekTime = 0;
-    }
-
-    /* ─── Регистрация настройки в меню Lampa ─────────────────── */
-
-    /**
-     * Добавляет пункт «Максимальный размер буфера видео»
-     * в раздел настроек Lampa.
-     * Используем Lampa.Settings.add() — стандартный способ
-     * для плагинов Lampa 2024+.
-     */
+    // Регистрируем настройку в отдельном компоненте настроек.
     function registerSettings() {
-        // Проверяем наличие API настроек
-        if (!Lampa.Settings || typeof Lampa.Settings.add !== 'function') {
-            console.warn('[' + PLUGIN_NAME + '] Lampa.Settings.add недоступен — настройка пропущена');
+        if (!Lampa || !Lampa.SettingsApi || !Lampa.SettingsApi.addComponent || !Lampa.SettingsApi.addParam) {
+            warn('SettingsApi is not available, settings registration skipped');
             return;
         }
 
-        Lampa.Settings.add(STORAGE_KEY, {
-            name       : 'Максимальный размер буфера видео',
-            description: 'Сколько минут видео заранее буферизировать (до 40 минут)',
-            type       : 'select',
-            values     : {
-                '5' : '5 минут',
-                '10': '10 минут',
-                '15': '15 минут',
-                '20': '20 минут (по умолчанию)',
-                '25': '25 минут',
-                '30': '30 минут',
-                '35': '35 минут',
-                '40': '40 минут (максимум)'
+        ensureDefaultValue();
+
+        // Создаём отдельный раздел настроек, чтобы плагин было легко найти.
+        Lampa.SettingsApi.addComponent({
+            component: 'advanced_buffer_control',
+            name: PLUGIN_TITLE,
+            icon: '<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="8" width="28" height="20" rx="3" stroke="white" stroke-width="2.5"/><path d="M10 18H26" stroke="white" stroke-width="2.5" stroke-linecap="round"/><path d="M10 13H20" stroke="white" stroke-width="2.5" stroke-linecap="round"/><path d="M10 23H18" stroke="white" stroke-width="2.5" stroke-linecap="round"/></svg>'
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'advanced_buffer_control',
+            param: {
+                name: STORAGE_KEY,
+                type: 'select',
+                values: BUFFER_OPTIONS,
+                default: DEFAULT_MINUTES
             },
-            default    : String(DEFAULT_MINS),
-            onChange   : function (value) {
-                // Если настройка изменилась прямо во время просмотра —
-                // применяем новое значение немедленно
-                console.log('[' + PLUGIN_NAME + '] Буфер изменён на ' + value + ' мин');
-                if (state.hls) {
-                    applyHlsConfig(state.hls, toSec(parseInt(value, 10)));
-                    forceHlsLoad(state.hls, state.video);
+            field: {
+                name: 'Максимальный размер буфера видео',
+                description: 'Сколько минут видео заранее буферизировать (максимум 40 минут)'
+            },
+            // Значение Storage.set уже сохраняется самим Settings/Params API,
+            // а здесь мы просто мгновенно применяем новую конфигурацию к активному плееру.
+            onChange: function () {
+                applyDefaultHlsConfig(window.Hls);
+                syncCurrentSession('settings-change');
+            }
+        });
+    }
+
+    // Обновляем глобальные дефолты hls.js, чтобы новые экземпляры сразу создавались с нужным буфером.
+    function applyDefaultHlsConfig(HlsCtor) {
+        var seconds;
+        var bytes;
+
+        if (!HlsCtor) return;
+
+        seconds = getTargetBufferSeconds();
+        bytes = getTargetBufferBytes(seconds);
+
+        try {
+            if (HlsCtor.DefaultConfig) {
+                HlsCtor.DefaultConfig.maxBufferLength = seconds;
+                HlsCtor.DefaultConfig.maxMaxBufferLength = seconds;
+                HlsCtor.DefaultConfig.maxBufferSize = bytes;
+            }
+        } catch (e) {
+            warn('failed to update Hls.DefaultConfig', e);
+        }
+    }
+
+    // Применяем конфиг к уже созданному экземпляру hls.js.
+    function applyHlsRuntimeConfig(hls) {
+        var seconds;
+        var bytes;
+
+        if (!hls || !hls.config) return;
+
+        seconds = getTargetBufferSeconds();
+        bytes = getTargetBufferBytes(seconds);
+
+        try {
+            hls.config.maxBufferLength = seconds;
+            hls.config.maxMaxBufferLength = seconds;
+            hls.config.maxBufferSize = bytes;
+        } catch (e) {
+            warn('failed to apply HLS runtime config', e);
+        }
+    }
+
+    // Навешиваем патч на глобальный Hls до того, как Lampa создаст экземпляр в PlayerVideo.url().
+    function ensureHlsPatched() {
+        var OriginalHls;
+        var originalAttachMedia;
+        var originalDestroy;
+
+        if (state.hlsPatched) return true;
+        if (typeof window.Hls === 'undefined') return false;
+
+        OriginalHls = window.Hls;
+
+        // Если Hls уже был обёрнут кем-то ранее, но это наша обёртка, повторно ничего не делаем.
+        if (OriginalHls && OriginalHls.__advancedBufferWrapped) {
+            state.hlsPatched = true;
+            applyDefaultHlsConfig(OriginalHls);
+            return true;
+        }
+
+        // Патчим attachMedia, чтобы привязать экземпляр hls к текущему <video>.
+        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferAttachPatched) {
+            originalAttachMedia = OriginalHls.prototype.attachMedia;
+
+            OriginalHls.prototype.attachMedia = function (media) {
+                var result = originalAttachMedia.apply(this, arguments);
+
+                try {
+                    if (media) {
+                        media.__advancedBufferHls = this;
+                    }
+
+                    window.__advancedBufferLastHls = this;
+                    state.lastHls = this;
+                    applyHlsRuntimeConfig(this);
+                } catch (e) {
+                    warn('attachMedia patch failed', e);
+                }
+
+                return result;
+            };
+
+            OriginalHls.prototype.__advancedBufferAttachPatched = true;
+        }
+
+        // Патчим destroy, чтобы не оставлять висящих ссылок на старый экземпляр.
+        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferDestroyPatched) {
+            originalDestroy = OriginalHls.prototype.destroy;
+
+            OriginalHls.prototype.destroy = function () {
+                try {
+                    var media = this.media || this._media;
+
+                    if (media && media.__advancedBufferHls === this) {
+                        delete media.__advancedBufferHls;
+                    }
+
+                    if (window.__advancedBufferLastHls === this) {
+                        window.__advancedBufferLastHls = null;
+                    }
+
+                    if (state.lastHls === this) {
+                        state.lastHls = null;
+                    }
+                } catch (e) {
+                    warn('destroy patch cleanup failed', e);
+                }
+
+                return originalDestroy.apply(this, arguments);
+            };
+
+            OriginalHls.prototype.__advancedBufferDestroyPatched = true;
+        }
+
+        // Оборачиваем сам конструктор, чтобы нужные лимиты буфера попадали в экземпляр сразу.
+        function WrappedHls(config) {
+            var mergedConfig = extend({}, config || {}, {
+                maxBufferLength: getTargetBufferSeconds(),
+                maxMaxBufferLength: getTargetBufferSeconds(),
+                maxBufferSize: getTargetBufferBytes(getTargetBufferSeconds())
+            });
+
+            var instance = new OriginalHls(mergedConfig);
+
+            state.lastHls = instance;
+            window.__advancedBufferLastHls = instance;
+            applyHlsRuntimeConfig(instance);
+
+            return instance;
+        }
+
+        WrappedHls.prototype = OriginalHls.prototype;
+
+        if (Object.setPrototypeOf) {
+            Object.setPrototypeOf(WrappedHls, OriginalHls);
+        } else {
+            WrappedHls.__proto__ = OriginalHls; // eslint-disable-line no-proto
+        }
+
+        WrappedHls.__advancedBufferWrapped = true;
+
+        window.Hls = WrappedHls;
+
+        state.hlsPatched = true;
+
+        applyDefaultHlsConfig(window.Hls);
+        log('Hls patched successfully');
+
+        return true;
+    }
+
+    // Забираем текущий video-элемент максимально безопасно для разных версий Lampa.
+    function getCurrentVideo() {
+        try {
+            if (Lampa.PlayerVideo && typeof Lampa.PlayerVideo.video === 'function') {
+                return Lampa.PlayerVideo.video();
+            }
+        } catch (e) {
+            warn('failed to read PlayerVideo.video()', e);
+        }
+
+        try {
+            return document.querySelector('.player video') || document.querySelector('video');
+        } catch (e2) {
+            return null;
+        }
+    }
+
+    // Ищем экземпляр hls.js, который реально привязан к текущему <video>.
+    function getCurrentHls(video) {
+        var candidates = [];
+        var i;
+
+        if (video && video.__advancedBufferHls) candidates.push(video.__advancedBufferHls);
+        if (window.hls) candidates.push(window.hls);
+        if (window.__advancedBufferLastHls) candidates.push(window.__advancedBufferLastHls);
+        if (state.lastHls) candidates.push(state.lastHls);
+
+        for (i = 0; i < candidates.length; i++) {
+            var candidate = candidates[i];
+            var media;
+
+            if (!candidate || typeof candidate.startLoad !== 'function') continue;
+
+            media = candidate.media || candidate._media || null;
+
+            if (!video || !media || media === video) {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    // Считаем реальный остаток буфера впереди от текущей позиции.
+    // Для hls.js сперва пробуем mainForwardBufferInfo, а если его нет — падаем на video.buffered.
+    function getForwardBufferInfo(video, hls) {
+        var current;
+        var buffered;
+        var i;
+
+        if (!video) {
+            return {
+                ahead: 0,
+                end: 0
+            };
+        }
+
+        current = toNumber(video.currentTime, 0);
+
+        try {
+            if (hls && hls.mainForwardBufferInfo && isFinite(hls.mainForwardBufferInfo.len)) {
+                return {
+                    ahead: Math.max(0, hls.mainForwardBufferInfo.len),
+                    end: current + Math.max(0, hls.mainForwardBufferInfo.len)
+                };
+            }
+        } catch (e) {
+            // Ничего не делаем: ниже есть универсальный fallback через video.buffered.
+        }
+
+        try {
+            buffered = video.buffered;
+
+            if (!buffered || !buffered.length) {
+                return {
+                    ahead: 0,
+                    end: current
+                };
+            }
+
+            for (i = 0; i < buffered.length; i++) {
+                var start = buffered.start(i);
+                var end = buffered.end(i);
+
+                // Небольшой tolerance нужен, чтобы не промахнуться из-за погрешностей float.
+                if (start - 0.35 <= current && end >= current) {
+                    return {
+                        ahead: Math.max(0, end - current),
+                        end: end
+                    };
                 }
             }
-        });
+        } catch (e2) {
+            warn('failed to read video.buffered', e2);
+        }
 
-        console.log('[' + PLUGIN_NAME + '] Настройка зарегистрирована в Lampa.Settings');
+        return {
+            ahead: 0,
+            end: current
+        };
     }
 
-    /* ─── Подписка на события плеера Lampa ──────────────────── */
+    // На старте каждой сессии дополнительно просим hls.js сразу продолжать загрузку.
+    function primeHlsBuffer(session, reason) {
+        if (!session || !session.video) return;
+        if (!session.hls || typeof session.hls.startLoad !== 'function') return;
 
-    /**
-     * Lampa использует глобальную шину событий Lampa.Listener.
-     * Нас интересуют события жизненного цикла плеера.
-     *
-     * Основные события:
-     *   player_start   — плеер открылся и начал воспроизведение
-     *   player_stop    — плеер закрыт (пользователь вышел)
-     *   player_destroy — плеер уничтожен
-     *
-     * В разных версиях Lampa имена могут немного отличаться,
-     * поэтому подписываемся на несколько вариантов.
-     */
-    function subscribeToPlayerEvents() {
-        // Ждём полной инициализации приложения
-        Lampa.Listener.follow('app', function (event) {
-            if (event.type === 'ready') {
-                // Приложение готово — регистрируем настройку
-                registerSettings();
-            }
-        });
-
-        // ── События плеера ──
-        Lampa.Listener.follow('player', function (event) {
-            var type = event.type;
-
-            if (
-                type === 'start'   ||   // плеер стартовал
-                type === 'play'    ||   // нажата кнопка «воспроизвести»
-                type === 'playing'      // видео реально началось
-            ) {
-                // Небольшая задержка, чтобы hls.js успел инициализироваться
-                setTimeout(onPlayerReady, 800);
-            }
-
-            if (
-                type === 'destroy' ||
-                type === 'stop'    ||
-                type === 'end'
-            ) {
-                // Плеер закрыт — освобождаем ресурсы
-                destroySession();
-            }
-        });
-
-        console.log('[' + PLUGIN_NAME + '] Подписка на события плеера установлена');
+        try {
+            applyHlsRuntimeConfig(session.hls);
+            session.hls.startLoad(toNumber(session.video.currentTime, -1));
+            session.lastForceAt = Date.now();
+            log('hls.startLoad() forced on', reason || 'prime');
+        } catch (e) {
+            warn('failed to prime HLS buffer', e);
+        }
     }
 
-    /* ─── Точка входа плагина ────────────────────────────────── */
+    // Для hls.js принудительная догрузка безопаснее всего делается через startLoad().
+    function forceHlsBuffer(session, reason) {
+        if (!session || !session.video || !session.hls) return;
+        if (typeof session.hls.startLoad !== 'function') return;
+        if (Date.now() - session.lastForceAt < HLS_FORCE_COOLDOWN) return;
 
-    /**
-     * Проверяем доступность Lampa API и запускаем плагин.
-     * Если API ещё не загружен — ждём события DOMContentLoaded.
-     */
-    function bootstrap() {
-        if (typeof Lampa === 'undefined' || !Lampa.Listener) {
-            // Lampa ещё не загружена — подождём
-            document.addEventListener('DOMContentLoaded', function () {
-                if (typeof Lampa !== 'undefined') {
-                    subscribeToPlayerEvents();
-                } else {
-                    console.error('[' + PLUGIN_NAME + '] Lampa API не обнаружен!');
+        try {
+            applyHlsRuntimeConfig(session.hls);
+            session.hls.startLoad(toNumber(session.video.currentTime, -1));
+            session.lastForceAt = Date.now();
+            log('forced HLS buffering, reason =', reason);
+        } catch (e) {
+            warn('failed to force HLS buffering', e);
+        }
+    }
+
+    // У нативного <video> нет прямого API для увеличения maxBufferLength,
+    // поэтому здесь используется максимально аккуратный "кик":
+    // краткий seek внутрь уже имеющегося буфера и немедленный возврат назад.
+    // Это best effort-механика и запускается редко, чтобы не дёргать поток лишний раз.
+    function forceNativeBuffer(session, info, reason) {
+        var video;
+        var current;
+        var duration;
+        var probeTime;
+
+        if (!session || !session.video || !info) return;
+        if (Date.now() - session.lastNativeForceAt < NATIVE_FORCE_COOLDOWN) return;
+
+        video = session.video;
+
+        if (session.nativeKickInProgress) return;
+        if (video.paused || video.seeking) return;
+        if (Date.now() - session.lastProgressAt < 4000) return;
+
+        current = toNumber(video.currentTime, 0);
+        duration = toNumber(video.duration, 0);
+
+        if (!isFinite(info.end) || info.end <= current + 2) return;
+        if (isFinite(duration) && duration > 0 && current >= duration - 10) return;
+
+        probeTime = Math.max(current + 0.15, info.end - 0.30);
+
+        if (probeTime <= current + 0.05) return;
+
+        session.lastNativeForceAt = Date.now();
+        session.nativeKickInProgress = true;
+
+        try {
+            video.currentTime = probeTime;
+        } catch (e) {
+            session.nativeKickInProgress = false;
+            warn('native buffer kick failed at forward seek', e);
+            return;
+        }
+
+        setTimeout(function () {
+            try {
+                video.currentTime = current;
+            } catch (e2) {
+                warn('native buffer kick failed at restore seek', e2);
+            }
+
+            session.nativeKickInProgress = false;
+            session.lastProgressAt = Date.now();
+            log('forced native buffering, reason =', reason);
+        }, 70);
+    }
+
+    // Проверяем, пора ли инициировать дальнейшую догрузку буфера.
+    function evaluateSession(reason) {
+        var session = state.currentSession;
+        var video;
+        var duration;
+        var info;
+        var playerIsOpened = !Lampa.Player || typeof Lampa.Player.opened !== 'function' || Lampa.Player.opened();
+
+        if (!session || session.destroyed || !playerIsOpened) return;
+
+        video = session.video || getCurrentVideo();
+
+        if (!video || typeof video.addEventListener !== 'function') return;
+        if (typeof video.buffered === 'undefined' || typeof video.currentTime === 'undefined') return;
+
+        session.video = video;
+        session.hls = getCurrentHls(video);
+
+        // Если это hls.js, каждый проход поддерживает актуальные лимиты буфера.
+        if (session.hls) {
+            applyHlsRuntimeConfig(session.hls);
+        }
+
+        // На всякий случай принудительно просим браузер максимально предзагружать видео.
+        try {
+            video.preload = 'auto';
+            video.setAttribute('preload', 'auto');
+        } catch (e) {
+            // Игнорируем, потому что на некоторых оболочках setAttribute может быть ограничен.
+        }
+
+        duration = toNumber(video.duration, 0);
+        var rawDuration = video.duration;
+
+        // Для live/iptv сценариев агрессивный большой буфер обычно не нужен и может мешать.
+        if ((session.playData && (session.playData.iptv || session.playData.tv || session.playData.need_check_live_stream)) || (rawDuration && !isFinite(rawDuration))) {
+            return;
+        }
+
+        // Пока выполняется внутренний seek-кик для нативного видео, лишний анализ не нужен.
+        if (session.nativeKickInProgress) {
+            return;
+        }
+
+        if (video.ended) return;
+        if (isFinite(duration) && duration > 0 && video.currentTime >= duration - 10) return;
+
+        info = getForwardBufferInfo(video, session.hls);
+        session.lastBufferInfo = info;
+
+        // hls.js можно "будить" даже когда буфер уже почти закончился.
+        if (session.hls && info.ahead <= LOW_BUFFER_THRESHOLD) {
+            forceHlsBuffer(session, reason);
+            return;
+        }
+
+        // Для нативного video делаем только мягкий kick и только когда буфер ещё есть,
+        // иначе можно спровоцировать лишний stall вместо пользы.
+        if (!session.hls && info.ahead > 2 && info.ahead <= LOW_BUFFER_THRESHOLD) {
+            forceNativeBuffer(session, info, reason);
+        }
+    }
+
+    // Навешиваем обработчики на текущий video только на время одной сессии проигрывания.
+    function bindSessionEvents(session) {
+        if (!session || !session.video) return;
+
+        session.handlers = {
+            progress: function () {
+                session.lastProgressAt = Date.now();
+                evaluateSession('progress');
+            },
+            timeupdate: function () {
+                evaluateSession('timeupdate');
+            },
+            loadeddata: function () {
+                session.lastProgressAt = Date.now();
+                session.hls = getCurrentHls(session.video);
+                if (session.hls) applyHlsRuntimeConfig(session.hls);
+                evaluateSession('loadeddata');
+            },
+            canplay: function () {
+                evaluateSession('canplay');
+            },
+            waiting: function () {
+                evaluateSession('waiting');
+            },
+            seeking: function () {
+                evaluateSession('seeking');
+            },
+            play: function () {
+                evaluateSession('play');
+            }
+        };
+
+        Object.keys(session.handlers).forEach(function (eventName) {
+            session.video.addEventListener(eventName, session.handlers[eventName]);
+        });
+
+        session.watchdog = setInterval(function () {
+            evaluateSession('watchdog');
+        }, WATCHDOG_INTERVAL);
+    }
+
+    // Снимаем все слушатели и таймеры после закрытия плеера или перед стартом новой сессии.
+    function destroyCurrentSession() {
+        var session = state.currentSession;
+
+        if (!session) return;
+
+        session.destroyed = true;
+
+        if (session.watchdog) {
+            clearInterval(session.watchdog);
+            session.watchdog = null;
+        }
+
+        if (session.video && session.handlers) {
+            Object.keys(session.handlers).forEach(function (eventName) {
+                try {
+                    session.video.removeEventListener(eventName, session.handlers[eventName]);
+                } catch (e) {
+                    // На cleanup такие ошибки не критичны.
                 }
             });
-        } else {
-            subscribeToPlayerEvents();
         }
+
+        state.currentSession = null;
     }
 
-    // ── Запуск ──
-    bootstrap();
+    // После ready() видео уже создано, но иногда DOM и hls привязываются не мгновенно,
+    // поэтому даём несколько коротких повторных попыток.
+    function startPlayerSession(playData, attempt) {
+        var session;
+        var video;
+        var playerIsOpened = !Lampa.Player || typeof Lampa.Player.opened !== 'function' || Lampa.Player.opened();
 
-    console.log('[' + PLUGIN_NAME + '] v' + PLUGIN_VERSION + ' — плагин инициализирован ✓');
+        if (attempt === undefined) attempt = 0;
+        if (!playerIsOpened) return;
+        if (playData && (playData.iptv || playData.tv || playData.need_check_live_stream)) return;
 
-})();
+        if (!state.currentSession || state.currentSession.playData !== playData) {
+            destroyCurrentSession();
+
+            state.currentSession = {
+                playData: playData || {},
+                video: null,
+                hls: null,
+                handlers: null,
+                watchdog: null,
+                destroyed: false,
+                lastForceAt: 0,
+                lastNativeForceAt: 0,
+                lastProgressAt: Date.now(),
+                nativeKickInProgress: false,
+                lastBufferInfo: null
+            };
+        }
+
+        session = state.currentSession;
+        video = getCurrentVideo();
+
+        if (!video || typeof video.addEventListener !== 'function' || typeof video.buffered === 'undefined' || typeof video.currentTime === 'undefined') {
+            if (attempt < 20) {
+                setTimeout(function () {
+                    startPlayerSession(playData, attempt + 1);
+                }, 250);
+            }
+
+            return;
+        }
+
+        session.video = video;
+        session.hls = getCurrentHls(video);
+
+        if (session.bound) {
+            evaluateSession('player-ready-reuse');
+            return;
+        }
+
+        try {
+            video.preload = 'auto';
+            video.setAttribute('preload', 'auto');
+        } catch (e) {
+            // Ничего страшного.
+        }
+
+        bindSessionEvents(session);
+        session.bound = true;
+
+        // Один стартовый "толчок" нужен, чтобы hls сразу догружал буфер до нового целевого лимита.
+        if (session.hls) {
+            primeHlsBuffer(session, 'player-ready');
+        }
+
+        evaluateSession('player-ready');
+        log('session started, buffer target =', getTargetBufferSeconds(), 'sec');
+    }
+
+    // Если пользователь изменил настройку во время воспроизведения, сразу применяем её к активному плееру.
+    function syncCurrentSession(reason) {
+        var session = state.currentSession;
+
+        applyDefaultHlsConfig(window.Hls);
+
+        if (!session || session.destroyed) return;
+
+        session.hls = getCurrentHls(session.video || getCurrentVideo());
+
+        if (session.hls) {
+            applyHlsRuntimeConfig(session.hls);
+            primeHlsBuffer(session, reason || 'sync');
+        }
+
+        evaluateSession(reason || 'sync');
+    }
+
+    // Основная инициализация плагина после готовности приложения.
+    function initPlugin() {
+        ensureDefaultValue();
+        registerSettings();
+        ensureHlsPatched();
+        applyDefaultHlsConfig(window.Hls);
+
+        // Важно: патчим Hls именно на событии start, потому что Lampa создаёт экземпляр hls.js
+        // сразу после Player.listener.send('start', data), внутри Video.url(...).
+        Lampa.Player.listener.follow('start', function (data) {
+            ensureHlsPatched();
+            applyDefaultHlsConfig(window.Hls);
+
+            // На всякий случай чистим старую сессию перед новым запуском видео.
+            destroyCurrentSession();
+
+            // IPTV/TV/Live лучше не трогать агрессивной буферизацией вперёд.
+            if (data && (data.iptv || data.tv)) {
+                return;
+            }
+        });
+
+        // На ready video уже доступен, поэтому здесь создаётся живая сессия мониторинга.
+        Lampa.Player.listener.follow('ready', function (data) {
+            startPlayerSession(data);
+        });
+
+        // При закрытии плеера обязательно снимаем все слушатели и сбрасываем ссылки.
+        Lampa.Player.listener.follow('destroy', function () {
+            destroyCurrentSession();
+        });
+
+        log(PLUGIN_NAME + ' v' + PLUGIN_VERSION + ' initialized');
+    }
+
+    // Стандартный шаблон инициализации Lampa-плагина.
+    if (window.appready) initPlugin();
+    else {
+        Lampa.Listener.follow('app', function (e) {
+            if (e.type === 'ready') initPlugin();
+        });
+    }
+
+    console.log('[Advanced Buffer Control] v1.0.0: file end');
+}());
