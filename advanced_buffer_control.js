@@ -33,6 +33,16 @@
     var PLUGIN_VERSION = '1.0.0';
     var ENABLED_KEY = 'advanced_buffer_control_enabled';
     var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
+    var MENU_TEXT = {
+        enabled_name: {
+            ru: 'Умное заполнение буфера',
+            en: 'Smart Buffer Fill'
+        },
+        enabled_description: {
+            ru: 'Автоматически заполнять буфер до фактического предела устройства',
+            en: 'Automatically fill the buffer up to the actual device limit'
+        }
+    };
 
     // Значения по умолчанию и безопасные пределы.
     var ENABLED_DEFAULT = true;
@@ -89,6 +99,49 @@
         }
 
         return target;
+    }
+
+    function getMenuLanguageCode() {
+        var lang = 'en';
+
+        try {
+            if (Lampa && Lampa.Storage && typeof Lampa.Storage.get === 'function') {
+                lang = String(Lampa.Storage.get('language', 'en') || 'en').toLowerCase();
+            }
+        } catch (e) {
+            lang = 'en';
+        }
+
+        return lang === 'ru' ? 'ru' : 'en';
+    }
+
+    function getMenuText(key) {
+        var code = getMenuLanguageCode();
+        var text = MENU_TEXT[key] || {};
+
+        return text[code] || text.en || '';
+    }
+
+    function createLocalizedField(nameKey, descriptionKey) {
+        var field = {};
+
+        Object.defineProperty(field, 'name', {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+                return getMenuText(nameKey);
+            }
+        });
+
+        Object.defineProperty(field, 'description', {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+                return getMenuText(descriptionKey);
+            }
+        });
+
+        return field;
     }
 
     // Безопасно приводим значение к числу.
@@ -194,10 +247,7 @@
                 type: 'trigger',
                 default: ENABLED_DEFAULT
             },
-            field: {
-                name: 'Умное заполнение буфера',
-                description: 'Автоматически заполнять буфер до фактического предела устройства'
-            },
+            field: createLocalizedField('enabled_name', 'enabled_description'),
             onChange: function (value) {
                 var enabled = String(value) === 'true';
 
