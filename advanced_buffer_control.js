@@ -1,6 +1,6 @@
 /*
  * Advanced Buffer Control / Умный большой буфер
- * Версия: 1.0.0
+ * Версия: 1.1.0
  *
  * Плагин для Lampa:
  * - добавляет настройку размера буфера в меню настроек;
@@ -11,12 +11,12 @@
 (function () {
     'use strict';
 
-    console.log('[Advanced Buffer Control] v1.0.0: file begin');
+    console.log('[Advanced Buffer Control] v1.1.0: file begin');
 
     // Защита от повторной инициализации, если файл был загружен несколько раз.
     if (window.advanced_buffer_control_plugin_ready) {
-        console.log('[Advanced Buffer Control] v1.0.0: already initialized');
-        console.log('[Advanced Buffer Control] v1.0.0: file end');
+        console.log('[Advanced Buffer Control] v1.1.0: already initialized');
+        console.log('[Advanced Buffer Control] v1.1.0: file end');
         return;
     }
 
@@ -25,13 +25,14 @@
     // Базовые константы плагина.
     var PLUGIN_NAME = 'Advanced Buffer Control';
     var PLUGIN_TITLE = 'Умный большой буфер';
-    var PLUGIN_VERSION = '1.0.0';
+    var PLUGIN_VERSION = '1.1.0';
     var STORAGE_KEY = 'advanced_buffer_control_minutes';
     var DEFAULT_MINUTES = '20';
     var LOW_BUFFER_THRESHOLD = 55;
     var HLS_FORCE_COOLDOWN = 8000;
     var NATIVE_FORCE_COOLDOWN = 12000;
     var WATCHDOG_INTERVAL = 2000;
+    var BACK_BUFFER_KEEP_SECONDS = 20;
 
     // Разрешённые значения буфера в минутах.
     var BUFFER_OPTIONS = {
@@ -118,14 +119,45 @@
     // Формула намеренно даёт довольно высокий потолок, чтобы не упираться в стандартные 60 MB,
     // но при этом не уходит в совсем экстремальные значения.
     function getTargetBufferBytes(seconds) {
-        var minBytes = 150 * 1024 * 1024;
-        var maxBytes = 1600 * 1024 * 1024;
-        var estimated = Math.round(seconds * 700000);
+        var minBytes = 256 * 1024 * 1024;
+        var maxBytes = 2048 * 1024 * 1024;
+        var estimated = Math.round(seconds * 1200000);
 
         if (estimated < minBytes) estimated = minBytes;
         if (estimated > maxBytes) estimated = maxBytes;
 
         return estimated;
+    }
+
+    // Определяем m3u8 не только по окончанию URL, но и по query-параметрам.
+    function isM3U8Url(url) {
+        url = (url || '') + '';
+        return /\.m3u8($|\?|#)/i.test(url);
+    }
+
+    // Находим самый лёгкий по битрейту уровень, чтобы при упоре в квоту
+    // можно было наращивать запас по времени, а не по мегабайтам.
+    function getLowestLevelIndex(hls) {
+        var levels;
+        var bestIndex = -1;
+        var bestBitrate = Infinity;
+        var i;
+        var bitrate;
+
+        if (!hls || !hls.levels || !hls.levels.length) return -1;
+
+        levels = hls.levels;
+
+        for (i = 0; i < levels.length; i++) {
+            bitrate = toNumber(levels[i].bitrate || levels[i].maxBitrate || levels[i].averageBitrate, Infinity);
+
+            if (bitrate < bestBitrate) {
+                bestBitrate = bitrate;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
     }
 
     // Инициализируем дефолтное значение, если пользователь ещё ни разу не открывал настройку.
@@ -193,6 +225,9 @@
                 HlsCtor.DefaultConfig.maxBufferLength = seconds;
                 HlsCtor.DefaultConfig.maxMaxBufferLength = seconds;
                 HlsCtor.DefaultConfig.maxBufferSize = bytes;
+                HlsCtor.DefaultConfig.backBufferLength = 0;
+                HlsCtor.DefaultConfig.liveBackBufferLength = 0;
+                HlsCtor.DefaultConfig.lowLatencyMode = false;
             }
         } catch (e) {
             warn('failed to update Hls.DefaultConfig', e);
@@ -213,8 +248,135 @@
             hls.config.maxBufferLength = seconds;
             hls.config.maxMaxBufferLength = seconds;
             hls.config.maxBufferSize = bytes;
+            hls.config.backBufferLength = 0;
+            hls.config.liveBackBufferLength = 0;
+            hls.config.lowLatencyMode = false;
         } catch (e) {
             warn('failed to apply HLS runtime config', e);
+        }
+    }
+
+    // Если браузер/MSE упёрся в квоту, aggressively чистим хвост позади текущей позиции.
+    function flushBackBuffer(session, keepSeconds) {
+        var hls;
+        var video;
+        var startOffset;
+        var endOffset;
+
+        if (!session || !session.hls || !session.video) return;
+
+        hls = session.hls;
+        video = session.video;
+        keepSeconds = toNumber(keepSeconds, BACK_BUFFER_KEEP_SECONDS);
+
+        if (!hls.trigger || !window.Hls || !window.Hls.Events || !window.Hls.Events.BUFFER_FLUSHING) return;
+
+        startOffset = 0;
+        endOffset = Math.max(0, toNumber(video.currentTime, 0) - keepSeconds);
+
+        if (endOffset <= 0) return;
+
+        try {
+            hls.trigger(window.Hls.Events.BUFFER_FLUSHING, {
+                startOffset: startOffset,
+                endOffset: endOffset
+            });
+        } catch (e) {
+            warn('failed to flush back buffer', e);
+        }
+    }
+
+    // При нехватке места по байтам наращиваем будущий буфер самым лёгким уровнем.
+    // Это компромисс: приоритет отдаётся минутам буфера, а не качеству удалённых сегментов.
+    function enableLowLevelPrefetch(session, reason) {
+        var hls;
+        var lowIndex;
+
+        if (!session || !session.hls) return;
+        if (session.forcedLowLevel) return;
+
+        hls = session.hls;
+        lowIndex = getLowestLevelIndex(hls);
+
+        if (lowIndex < 0) return;
+
+        try {
+            hls.nextLoadLevel = lowIndex;
+            session.forcedLowLevel = true;
+            log('enabled low-level prefetch, reason =', reason, 'level =', lowIndex);
+        } catch (e) {
+            warn('failed to enable low-level prefetch', e);
+        }
+    }
+
+    // Когда критическая нехватка места ушла, возвращаемся к авто-логике hls.js.
+    function disableLowLevelPrefetch(session, reason) {
+        var hls;
+
+        if (!session || !session.hls || !session.forcedLowLevel) return;
+
+        hls = session.hls;
+
+        try {
+            if (typeof hls.nextAutoLevel === 'number' && isFinite(hls.nextAutoLevel) && hls.nextAutoLevel >= 0) {
+                hls.nextLoadLevel = hls.nextAutoLevel;
+            }
+
+            session.forcedLowLevel = false;
+            log('disabled low-level prefetch, reason =', reason);
+        } catch (e) {
+            warn('failed to disable low-level prefetch', e);
+        }
+    }
+
+    // Подключаемся к событиям hls.js, чтобы отслеживать buffer-full и повторно возвращать нужные лимиты.
+    function bindHlsEvents(session) {
+        var hls;
+        var HlsCtor;
+
+        if (!session || !session.hls) return;
+        if (session.hlsBound === session.hls) return;
+
+        hls = session.hls;
+        HlsCtor = window.Hls;
+
+        if (!HlsCtor || !HlsCtor.Events || typeof hls.on !== 'function') return;
+
+        session.hlsBound = hls;
+
+        try {
+            hls.on(HlsCtor.Events.MANIFEST_PARSED, function () {
+                applyHlsRuntimeConfig(hls);
+                evaluateSession('hls-manifest-parsed');
+            });
+
+            hls.on(HlsCtor.Events.LEVEL_SWITCHED, function () {
+                applyHlsRuntimeConfig(hls);
+            });
+
+            hls.on(HlsCtor.Events.FRAG_BUFFERED, function () {
+                evaluateSession('hls-frag-buffered');
+            });
+
+            hls.on(HlsCtor.Events.ERROR, function (event, data) {
+                if (!data || !data.details) return;
+
+                if (data.details === HlsCtor.ErrorDetails.BUFFER_FULL_ERROR || data.details === HlsCtor.ErrorDetails.BUFFER_APPENDING_ERROR) {
+                    session.quotaLimited = true;
+                    applyHlsRuntimeConfig(hls);
+                    flushBackBuffer(session, BACK_BUFFER_KEEP_SECONDS);
+                    enableLowLevelPrefetch(session, data.details);
+                    forceHlsBuffer(session, data.details);
+                    return;
+                }
+
+                if (data.details === HlsCtor.ErrorDetails.BUFFER_STALLED_ERROR) {
+                    applyHlsRuntimeConfig(hls);
+                    forceHlsBuffer(session, data.details);
+                }
+            });
+        } catch (e) {
+            warn('failed to bind hls events', e);
         }
     }
 
@@ -534,6 +696,7 @@
         // Если это hls.js, каждый проход поддерживает актуальные лимиты буфера.
         if (session.hls) {
             applyHlsRuntimeConfig(session.hls);
+            bindHlsEvents(session);
         }
 
         // На всякий случай принудительно просим браузер максимально предзагружать видео.
@@ -562,6 +725,21 @@
 
         info = getForwardBufferInfo(video, session.hls);
         session.lastBufferInfo = info;
+
+        if (session.hls) {
+            // Если hls.js успел сам уменьшить лимит, сразу возвращаем выбранное пользователем значение.
+            if (toNumber(session.hls.config && session.hls.config.maxMaxBufferLength, 0) < getTargetBufferSeconds()) {
+                applyHlsRuntimeConfig(session.hls);
+            }
+
+            // Если уже был buffer-full, стараемся держать будущее на самом лёгком уровне,
+            // пока вперёд не накопится хотя бы заметный запас.
+            if (session.quotaLimited && info.ahead < Math.min(getTargetBufferSeconds(), 240)) {
+                enableLowLevelPrefetch(session, 'quota-limited');
+            } else if (info.ahead > Math.min(getTargetBufferSeconds(), 300)) {
+                disableLowLevelPrefetch(session, 'buffer-recovered');
+            }
+        }
 
         // hls.js можно "будить" даже когда буфер уже почти закончился.
         if (session.hls && info.ahead <= LOW_BUFFER_THRESHOLD) {
@@ -668,7 +846,10 @@
                 lastNativeForceAt: 0,
                 lastProgressAt: Date.now(),
                 nativeKickInProgress: false,
-                lastBufferInfo: null
+                lastBufferInfo: null,
+                quotaLimited: false,
+                forcedLowLevel: false,
+                hlsBound: null
             };
         }
 
@@ -750,6 +931,13 @@
             if (data && (data.iptv || data.tv)) {
                 return;
             }
+
+            // Ключевое отличие от прошлой версии:
+            // если это HLS-поток и hls.js доступен, принудительно просим Lampa использовать именно hls.js,
+            // а не нативный HLS плеер браузка/вебвью, который часто и даёт потолок около 2-3 минут.
+            if (data && data.url && isM3U8Url(data.url) && typeof window.Hls !== 'undefined' && window.Hls.isSupported && window.Hls.isSupported()) {
+                data.hls_type = 'hlsjs';
+            }
         });
 
         // На ready video уже доступен, поэтому здесь создаётся живая сессия мониторинга.
@@ -773,5 +961,5 @@
         });
     }
 
-    console.log('[Advanced Buffer Control] v1.0.0: file end');
+    console.log('[Advanced Buffer Control] v1.1.0: file end');
 }());
