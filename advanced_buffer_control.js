@@ -1,6 +1,6 @@
 /*
  * Advanced Buffer Control / Умный большой буфер
- * Версия: 1.1.0
+ * Версия: 1.2.0
  *
  * Плагин для Lampa:
  * - добавляет настройку размера буфера в меню настроек;
@@ -11,12 +11,12 @@
 (function () {
     'use strict';
 
-    console.log('[Advanced Buffer Control] v1.1.0: file begin');
+    console.log('[Advanced Buffer Control] v1.2.0: file begin');
 
     // Защита от повторной инициализации, если файл был загружен несколько раз.
     if (window.advanced_buffer_control_plugin_ready) {
-        console.log('[Advanced Buffer Control] v1.1.0: already initialized');
-        console.log('[Advanced Buffer Control] v1.1.0: file end');
+        console.log('[Advanced Buffer Control] v1.2.0: already initialized');
+        console.log('[Advanced Buffer Control] v1.2.0: file end');
         return;
     }
 
@@ -25,7 +25,7 @@
     // Базовые константы плагина.
     var PLUGIN_NAME = 'Advanced Buffer Control';
     var PLUGIN_TITLE = 'Умный большой буфер';
-    var PLUGIN_VERSION = '1.1.0';
+    var PLUGIN_VERSION = '1.2.0';
     var STORAGE_KEY = 'advanced_buffer_control_minutes';
     var DEFAULT_MINUTES = '20';
     var LOW_BUFFER_THRESHOLD = 55;
@@ -50,7 +50,8 @@
     var state = {
         hlsPatched: false,
         lastHls: null,
-        currentSession: null
+        currentSession: null,
+        playerInfoPatched: false
     };
 
     // Короткий логгер, чтобы все сообщения плагина было легко отфильтровать в консоли.
@@ -129,6 +130,293 @@
         return estimated;
     }
 
+    // Простая строковая хеш-функция для генерации короткого ключа кэша.
+    function hashString(input) {
+        var hash = 5381;
+        var i;
+
+        input = String(input || '');
+
+        for (i = 0; i < input.length; i++) {
+            hash = ((hash << 5) + hash) + input.charCodeAt(i);
+            hash = hash & hash;
+        }
+
+        return 'h' + Math.abs(hash);
+    }
+
+    // Создаём уникальный ключ сегмента с учётом Range-запроса.
+    function buildSegmentKey(url, rangeStart, rangeEnd) {
+        return String(url || '') + '||' + String(rangeStart || 0) + '||' + String(rangeEnd || 0);
+    }
+
+    // Берём ключ из контекста загрузчика hls.js.
+    function buildSegmentKeyFromContext(context) {
+        return buildSegmentKey(
+            context && context.url,
+            context && context.rangeStart,
+            context && context.rangeEnd
+        );
+    }
+
+    // Берём ключ прямо из объекта Fragment.
+    function buildSegmentKeyFromFragment(frag) {
+        return buildSegmentKey(
+            frag && frag.url,
+            frag && frag.byteRangeStartOffset,
+            frag && frag.byteRangeEndOffset
+        );
+    }
+
+    // Формируем безопасный URL для CacheStorage.
+    // Это не сетевой адрес, а только внутренний ключ для локального кэша браузера.
+    function buildCacheRequestUrl(session, key) {
+        var origin = (window.location && window.location.origin) ? window.location.origin : 'https://advanced-buffer-control.local';
+        return origin + '/__abc_segment_cache__/' + encodeURIComponent(session.id) + '/' + encodeURIComponent(hashString(key));
+    }
+
+    // Создаём стандартный объект статистики, если загрузка шла не через штатный loader hls.js.
+    function createLoaderStats(loadedBytes, startedAt) {
+        var now = (window.performance && performance.now) ? performance.now() : Date.now();
+
+        return {
+            aborted: false,
+            loaded: loadedBytes || 0,
+            retry: 0,
+            total: loadedBytes || 0,
+            chunkCount: 1,
+            bwEstimate: 0,
+            loading: {
+                start: startedAt || now,
+                first: startedAt || now,
+                end: now
+            },
+            parsing: {
+                start: 0,
+                end: 0
+            },
+            buffering: {
+                start: 0,
+                first: 0,
+                end: 0
+            }
+        };
+    }
+
+    // Проверяем, доступен ли дисковый CacheStorage.
+    function canUsePersistentCache() {
+        return !!(window.caches && window.Response);
+    }
+
+    // Инициализация служебных структур одной сессии воспроизведения.
+    function ensureSessionInternals(session) {
+        if (!session) return;
+
+        if (!session.id) session.id = 'abc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+        if (!session.segmentMeta) session.segmentMeta = {};
+        if (!session.prefetchQueue) session.prefetchQueue = [];
+        if (!session.prefetchInFlight) session.prefetchInFlight = {};
+        if (!session.memoryStore) session.memoryStore = {};
+        if (!session.memoryOrder) session.memoryOrder = [];
+        if (!session.memoryBytes) session.memoryBytes = 0;
+        if (!session.memoryLimitBytes) session.memoryLimitBytes = 128 * 1024 * 1024;
+        if (!session.cacheName) session.cacheName = 'advanced-buffer-control-' + session.id;
+    }
+
+    // Удаляем самый старый элемент из memory fallback-кэша.
+    function evictOldestMemoryEntry(session) {
+        var oldestKey;
+        var item;
+
+        ensureSessionInternals(session);
+
+        oldestKey = session.memoryOrder.shift();
+        if (!oldestKey) return;
+
+        item = session.memoryStore[oldestKey];
+        if (item) {
+            session.memoryBytes -= item.size || 0;
+            delete session.memoryStore[oldestKey];
+        }
+    }
+
+    // Сохраняем сегмент в memory fallback, если CacheStorage недоступен.
+    function putMemorySegment(session, key, buffer) {
+        var size = buffer ? (buffer.byteLength || 0) : 0;
+
+        ensureSessionInternals(session);
+
+        if (session.memoryStore[key]) {
+            session.memoryBytes -= session.memoryStore[key].size || 0;
+        } else {
+            session.memoryOrder.push(key);
+        }
+
+        session.memoryStore[key] = {
+            buffer: buffer,
+            size: size,
+            at: Date.now()
+        };
+
+        session.memoryBytes += size;
+
+        while (session.memoryBytes > session.memoryLimitBytes && session.memoryOrder.length) {
+            evictOldestMemoryEntry(session);
+        }
+    }
+
+    // Читаем сегмент из memory fallback.
+    function getMemorySegment(session, key) {
+        var item;
+
+        ensureSessionInternals(session);
+        item = session.memoryStore[key];
+
+        if (!item || !item.buffer) return Promise.resolve(null);
+
+        item.at = Date.now();
+        return Promise.resolve(item.buffer.slice(0));
+    }
+
+    // Сохраняем сегмент в CacheStorage.
+    function putPersistentSegment(session, key, buffer) {
+        ensureSessionInternals(session);
+
+        return window.caches.open(session.cacheName).then(function (cache) {
+            var requestUrl = buildCacheRequestUrl(session, key);
+            var response = new Response(buffer, {
+                headers: {
+                    'Content-Type': 'application/octet-stream'
+                }
+            });
+
+            return cache.put(requestUrl, response);
+        });
+    }
+
+    // Читаем сегмент из CacheStorage.
+    function getPersistentSegment(session, key) {
+        ensureSessionInternals(session);
+
+        return window.caches.open(session.cacheName).then(function (cache) {
+            return cache.match(buildCacheRequestUrl(session, key)).then(function (response) {
+                if (!response) return null;
+                return response.arrayBuffer();
+            });
+        });
+    }
+
+    // Унифицированное чтение сегмента из локального кэша.
+    function getCachedSegment(session, key) {
+        ensureSessionInternals(session);
+
+        if (canUsePersistentCache()) {
+            return getPersistentSegment(session, key).catch(function () {
+                return getMemorySegment(session, key);
+            });
+        }
+
+        return getMemorySegment(session, key);
+    }
+
+    // Унифицированная запись сегмента в локальный кэш.
+    function putCachedSegment(session, key, buffer) {
+        ensureSessionInternals(session);
+
+        if (canUsePersistentCache()) {
+            return putPersistentSegment(session, key, buffer).catch(function () {
+                putMemorySegment(session, key, buffer);
+            });
+        }
+
+        putMemorySegment(session, key, buffer);
+        return Promise.resolve();
+    }
+
+    // Полная очистка кэша одной игровой сессии.
+    function clearSessionCache(session) {
+        if (!session) return;
+
+        ensureSessionInternals(session);
+
+        session.memoryStore = {};
+        session.memoryOrder = [];
+        session.memoryBytes = 0;
+
+        if (canUsePersistentCache()) {
+            window.caches.delete(session.cacheName).catch(function () {});
+        }
+    }
+
+    // Аккуратный XHR-фетч сегмента для фоновой предзагрузки.
+    function fetchSegmentArrayBuffer(session, descriptor) {
+        return new Promise(function (resolve, reject) {
+            var xhr = new XMLHttpRequest();
+            var sent = false;
+            var timeout = 60000;
+            var xhrSetup = session && session.hls && session.hls.config ? session.hls.config.xhrSetup : null;
+
+            xhr.open('GET', descriptor.url, true);
+            xhr.responseType = 'arraybuffer';
+            xhr.timeout = timeout;
+
+            if (descriptor.rangeEnd && descriptor.rangeEnd > descriptor.rangeStart) {
+                xhr.setRequestHeader('Range', 'bytes=' + descriptor.rangeStart + '-' + (descriptor.rangeEnd - 1));
+            }
+
+            xhr.onload = function () {
+                if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+                    resolve(xhr.response);
+                } else {
+                    reject(new Error('HTTP ' + xhr.status));
+                }
+            };
+
+            xhr.onerror = function () {
+                reject(new Error('Network error'));
+            };
+
+            xhr.ontimeout = function () {
+                reject(new Error('Timeout'));
+            };
+
+            function send() {
+                if (sent) return;
+                sent = true;
+                xhr.send();
+            }
+
+            try {
+                if (typeof xhrSetup === 'function') {
+                    var maybePromise = xhrSetup(xhr, descriptor.url);
+
+                    if (maybePromise && typeof maybePromise.then === 'function') {
+                        maybePromise.then(send).catch(send);
+                    } else {
+                        send();
+                    }
+                } else {
+                    send();
+                }
+            } catch (e) {
+                send();
+            }
+        });
+    }
+
+    // Возвращаем человекочитаемую длительность для подписи кэша в инфо плеера.
+    function toHumanSeconds(seconds) {
+        if (Lampa && Lampa.Utils && typeof Lampa.Utils.secondsToTimeHuman === 'function') {
+            return Lampa.Utils.secondsToTimeHuman(seconds);
+        }
+
+        seconds = Math.max(0, Math.round(seconds || 0));
+
+        if (seconds >= 3600) return Math.round(seconds / 3600) + ' ч.';
+        if (seconds >= 60) return Math.round(seconds / 60) + ' м.';
+        return seconds + ' с.';
+    }
+
     // Определяем m3u8 не только по окончанию URL, но и по query-параметрам.
     function isM3U8Url(url) {
         url = (url || '') + '';
@@ -158,6 +446,365 @@
         }
 
         return bestIndex;
+    }
+
+    // Выбираем уровень, детали плейлиста которого уже загружены и подходят для предзагрузки.
+    function getPrefetchLevelIndex(session) {
+        var hls;
+        var candidates;
+        var i;
+        var index;
+
+        if (!session || !session.hls) return -1;
+
+        hls = session.hls;
+        candidates = [];
+
+        if (session.forcedLowLevel) candidates.push(getLowestLevelIndex(hls));
+        candidates.push(hls.nextLoadLevel);
+        candidates.push(hls.loadLevel);
+        candidates.push(hls.currentLevel);
+        candidates.push(hls.nextAutoLevel);
+        candidates.push(hls.startLevel);
+
+        for (i = 0; i < candidates.length; i++) {
+            index = toNumber(candidates[i], -1);
+
+            if (index >= 0 && hls.levels && hls.levels[index] && hls.levels[index].details) {
+                return index;
+            }
+        }
+
+        if (hls.levels && hls.levels.length) {
+            for (i = 0; i < hls.levels.length; i++) {
+                if (hls.levels[i] && hls.levels[i].details) return i;
+            }
+        }
+
+        return -1;
+    }
+
+    // Собираем описание сегмента для фоновой предзагрузки.
+    function createSegmentDescriptor(frag, levelIndex) {
+        if (!frag || !frag.url) return null;
+
+        return {
+            key: buildSegmentKeyFromFragment(frag),
+            url: frag.url,
+            rangeStart: frag.byteRangeStartOffset || 0,
+            rangeEnd: frag.byteRangeEndOffset || 0,
+            start: toNumber(frag.start, 0),
+            end: toNumber(frag.end, toNumber(frag.start, 0) + toNumber(frag.duration, 0)),
+            duration: toNumber(frag.duration, 0),
+            levelIndex: levelIndex
+        };
+    }
+
+    // Считаем виртуальный конец буфера: реальный MSE-буфер + непрерывная цепочка уже кешированных HLS-сегментов.
+    function getVirtualBufferEnd(session, actualEnd) {
+        var end = toNumber(actualEnd, 0);
+        var keys;
+        var items;
+        var i;
+
+        if (!session || !session.segmentMeta) return end;
+
+        keys = Object.keys(session.segmentMeta);
+        items = [];
+
+        for (i = 0; i < keys.length; i++) {
+            var item = session.segmentMeta[keys[i]];
+
+            if (item && item.cached && item.start <= end + 1 && item.end > end) {
+                items.push(item);
+            }
+        }
+
+        items.sort(function (a, b) {
+            return a.start - b.start;
+        });
+
+        for (i = 0; i < items.length; i++) {
+            if (items[i].start <= end + 1 && items[i].end > end) {
+                end = items[i].end;
+            }
+        }
+
+        return end;
+    }
+
+    // Вычисляем "умный буфер": реальный буфер плюс внешний кэш сегментов.
+    function getVirtualBufferInfo(session, realInfo) {
+        var current;
+        var virtualEnd;
+
+        if (!session || !session.video) return realInfo;
+
+        current = toNumber(session.video.currentTime, 0);
+        virtualEnd = getVirtualBufferEnd(session, realInfo ? realInfo.end : current);
+
+        return {
+            ahead: Math.max(0, virtualEnd - current),
+            end: virtualEnd
+        };
+    }
+
+    // Патчим PlayerInfo, чтобы пользователь видел не только физический MSE-буфер, но и внешний HLS-кэш.
+    function patchPlayerInfo() {
+        var originalSet;
+
+        if (state.playerInfoPatched) return;
+        if (!Lampa || !Lampa.PlayerInfo || typeof Lampa.PlayerInfo.set !== 'function') return;
+
+        originalSet = Lampa.PlayerInfo.set;
+
+        Lampa.PlayerInfo.set = function (need, value) {
+            var session;
+            var realInfo;
+            var virtualInfo;
+            var cacheAhead;
+
+            if (need === 'bitrate' && typeof value === 'string') {
+                session = state.currentSession;
+
+                if (session && session.lastBufferInfo) {
+                    realInfo = session.lastBufferInfo;
+                    virtualInfo = getVirtualBufferInfo(session, realInfo);
+                    cacheAhead = Math.max(0, virtualInfo.ahead - realInfo.ahead);
+
+                    if (cacheAhead > 20) {
+                        value += ' &nbsp;•&nbsp; Кэш ' + toHumanSeconds(cacheAhead);
+                    }
+                }
+            }
+
+            return originalSet.call(this, need, value);
+        };
+
+        state.playerInfoPatched = true;
+    }
+
+    // Конструктор кастомного fragment loader:
+    // сначала пытаемся отдать сегмент из локального кэша, иначе используем стандартный loader hls.js.
+    function createAdvancedFragmentLoader(BaseLoaderCtor) {
+        function AdvancedFragmentLoader(config) {
+            this.config = config || {};
+            this.context = null;
+            this.stats = createLoaderStats(0);
+            this.inner = BaseLoaderCtor ? new BaseLoaderCtor(config) : null;
+            this.aborted = false;
+            this.destroyed = false;
+        }
+
+        AdvancedFragmentLoader.prototype.destroy = function () {
+            this.destroyed = true;
+            this.abort();
+            if (this.inner && typeof this.inner.destroy === 'function') this.inner.destroy();
+        };
+
+        AdvancedFragmentLoader.prototype.abort = function () {
+            this.aborted = true;
+            if (this.inner && typeof this.inner.abort === 'function') this.inner.abort();
+        };
+
+        AdvancedFragmentLoader.prototype.getCacheAge = function () {
+            if (this.inner && typeof this.inner.getCacheAge === 'function') return this.inner.getCacheAge();
+            return null;
+        };
+
+        AdvancedFragmentLoader.prototype.getResponseHeader = function (name) {
+            if (this.inner && typeof this.inner.getResponseHeader === 'function') return this.inner.getResponseHeader(name);
+            return null;
+        };
+
+        AdvancedFragmentLoader.prototype.load = function (context, loaderConfig, callbacks) {
+            var self = this;
+            var key = buildSegmentKeyFromContext(context);
+            var session = state.currentSession;
+            var startTime = (window.performance && performance.now) ? performance.now() : Date.now();
+
+            this.aborted = false;
+            this.context = context;
+
+            function useInnerLoader() {
+                if (!self.inner || typeof self.inner.load !== 'function') {
+                    callbacks.onError({ code: 0, text: 'Base loader unavailable' }, context, null, self.stats);
+                    return;
+                }
+
+                self.inner.load(context, loaderConfig, {
+                    onSuccess: function (response, stats, ctx, networkDetails) {
+                        var payload = response && response.data;
+
+                        self.stats = stats || self.stats;
+
+                        if (session && payload && payload.byteLength) {
+                            putCachedSegment(session, key, payload).then(function () {
+                                if (!session.segmentMeta[key]) session.segmentMeta[key] = {};
+                                session.segmentMeta[key].cached = true;
+                            }).catch(function () {});
+                        }
+
+                        callbacks.onSuccess(response, stats, ctx, networkDetails);
+                    },
+                    onError: function (error, ctx, networkDetails, stats) {
+                        self.stats = stats || self.stats;
+                        callbacks.onError(error, ctx, networkDetails, stats);
+                    },
+                    onTimeout: function (stats, ctx, networkDetails) {
+                        self.stats = stats || self.stats;
+                        callbacks.onTimeout(stats, ctx, networkDetails);
+                    },
+                    onAbort: function (stats, ctx, networkDetails) {
+                        self.stats = stats || self.stats;
+                        if (callbacks.onAbort) callbacks.onAbort(stats, ctx, networkDetails);
+                    },
+                    onProgress: callbacks.onProgress
+                });
+            }
+
+            if (!session) {
+                useInnerLoader();
+                return;
+            }
+
+            ensureSessionInternals(session);
+
+            getCachedSegment(session, key).then(function (buffer) {
+                if (self.aborted || self.destroyed) {
+                    if (callbacks.onAbort) callbacks.onAbort(self.stats, context, null);
+                    return;
+                }
+
+                if (buffer && buffer.byteLength) {
+                    self.stats = createLoaderStats(buffer.byteLength, startTime);
+                    callbacks.onSuccess({
+                        url: context.url,
+                        data: buffer,
+                        code: 200
+                    }, self.stats, context, null);
+                } else {
+                    useInnerLoader();
+                }
+            }).catch(function () {
+                useInnerLoader();
+            });
+        };
+
+        return AdvancedFragmentLoader;
+    }
+
+    // Ставим задачу в очередь фоновой предзагрузки.
+    function enqueuePrefetch(session, descriptor) {
+        var i;
+
+        ensureSessionInternals(session);
+
+        if (!descriptor || !descriptor.key) return;
+        if (session.prefetchInFlight[descriptor.key]) return;
+        if (session.segmentMeta[descriptor.key] && session.segmentMeta[descriptor.key].cached) return;
+
+        for (i = 0; i < session.prefetchQueue.length; i++) {
+            if (session.prefetchQueue[i].key === descriptor.key) return;
+        }
+
+        session.prefetchQueue.push(descriptor);
+        session.segmentMeta[descriptor.key] = extend({}, session.segmentMeta[descriptor.key], descriptor);
+    }
+
+    // Выполняем одну задачу фоновой предзагрузки.
+    function runPrefetchQueue(session) {
+        var descriptor;
+
+        if (!session || session.destroyed || !session.quotaLimited) return;
+
+        ensureSessionInternals(session);
+
+        if (session.prefetchBusy) return;
+        if (!session.prefetchQueue.length) return;
+
+        descriptor = session.prefetchQueue.shift();
+        if (!descriptor) return;
+
+        if (session.segmentMeta[descriptor.key] && session.segmentMeta[descriptor.key].cached) {
+            setTimeout(function () {
+                runPrefetchQueue(session);
+            }, 0);
+            return;
+        }
+
+        session.prefetchBusy = true;
+        session.prefetchInFlight[descriptor.key] = true;
+
+        fetchSegmentArrayBuffer(session, descriptor).then(function (buffer) {
+            return putCachedSegment(session, descriptor.key, buffer).then(function () {
+                session.segmentMeta[descriptor.key] = extend({}, session.segmentMeta[descriptor.key], descriptor, {
+                    cached: true,
+                    size: buffer.byteLength || 0,
+                    at: Date.now()
+                });
+            });
+        }).catch(function (e) {
+            warn('prefetch failed', e && e.message ? e.message : e);
+        }).then(function () {
+            delete session.prefetchInFlight[descriptor.key];
+            session.prefetchBusy = false;
+
+            setTimeout(function () {
+                runPrefetchQueue(session);
+            }, 10);
+        });
+    }
+
+    // Планируем предзагрузку будущих сегментов до выбранного пользователем горизонта.
+    function schedulePrefetch(session, realInfo) {
+        var hls;
+        var levelIndex;
+        var level;
+        var details;
+        var fragments;
+        var current;
+        var virtualInfo;
+        var targetEnd;
+        var startFrom;
+        var i;
+        var frag;
+        var descriptor;
+
+        if (!session || !session.hls || !session.video || !session.quotaLimited) return;
+
+        hls = session.hls;
+        levelIndex = getPrefetchLevelIndex(session);
+
+        if (levelIndex < 0 || !hls.levels || !hls.levels[levelIndex]) return;
+
+        level = hls.levels[levelIndex];
+        details = level.details;
+
+        if (!details || !details.fragments || !details.fragments.length) return;
+
+        fragments = details.fragments;
+        current = toNumber(session.video.currentTime, 0);
+        virtualInfo = getVirtualBufferInfo(session, realInfo || session.lastBufferInfo || { end: current, ahead: 0 });
+        targetEnd = current + getTargetBufferSeconds();
+
+        if (virtualInfo.end >= targetEnd - 5) return;
+
+        // Реальный буфер hls.js оставляем ему самому, а внешний кэш начинаем со следующего хвоста.
+        startFrom = Math.max(virtualInfo.end, (realInfo && realInfo.end) ? realInfo.end : current);
+
+        for (i = 0; i < fragments.length; i++) {
+            frag = fragments[i];
+
+            if (!frag) continue;
+            if (toNumber(frag.start, 0) + toNumber(frag.duration, 0) <= startFrom + 0.25) continue;
+            if (toNumber(frag.start, 0) >= targetEnd + 0.25) break;
+
+            descriptor = createSegmentDescriptor(frag, levelIndex);
+            enqueuePrefetch(session, descriptor);
+        }
+
+        runPrefetchQueue(session);
     }
 
     // Инициализируем дефолтное значение, если пользователь ещё ни разу не открывал настройку.
@@ -348,14 +995,17 @@
             hls.on(HlsCtor.Events.MANIFEST_PARSED, function () {
                 applyHlsRuntimeConfig(hls);
                 evaluateSession('hls-manifest-parsed');
+                schedulePrefetch(session, session.lastBufferInfo);
             });
 
             hls.on(HlsCtor.Events.LEVEL_SWITCHED, function () {
                 applyHlsRuntimeConfig(hls);
+                schedulePrefetch(session, session.lastBufferInfo);
             });
 
             hls.on(HlsCtor.Events.FRAG_BUFFERED, function () {
                 evaluateSession('hls-frag-buffered');
+                schedulePrefetch(session, session.lastBufferInfo);
             });
 
             hls.on(HlsCtor.Events.ERROR, function (event, data) {
@@ -367,12 +1017,14 @@
                     flushBackBuffer(session, BACK_BUFFER_KEEP_SECONDS);
                     enableLowLevelPrefetch(session, data.details);
                     forceHlsBuffer(session, data.details);
+                    schedulePrefetch(session, session.lastBufferInfo);
                     return;
                 }
 
                 if (data.details === HlsCtor.ErrorDetails.BUFFER_STALLED_ERROR) {
                     applyHlsRuntimeConfig(hls);
                     forceHlsBuffer(session, data.details);
+                    schedulePrefetch(session, session.lastBufferInfo);
                 }
             });
         } catch (e) {
@@ -454,10 +1106,13 @@
 
         // Оборачиваем сам конструктор, чтобы нужные лимиты буфера попадали в экземпляр сразу.
         function WrappedHls(config) {
+            var baseFragmentLoader = (config && config.fLoader) || (config && config.loader) || (OriginalHls.DefaultConfig && (OriginalHls.DefaultConfig.fLoader || OriginalHls.DefaultConfig.loader));
+            var advancedFragmentLoader = createAdvancedFragmentLoader(baseFragmentLoader);
             var mergedConfig = extend({}, config || {}, {
                 maxBufferLength: getTargetBufferSeconds(),
                 maxMaxBufferLength: getTargetBufferSeconds(),
-                maxBufferSize: getTargetBufferBytes(getTargetBufferSeconds())
+                maxBufferSize: getTargetBufferBytes(getTargetBufferSeconds()),
+                fLoader: advancedFragmentLoader
             });
 
             var instance = new OriginalHls(mergedConfig);
@@ -681,6 +1336,7 @@
         var video;
         var duration;
         var info;
+        var virtualInfo;
         var playerIsOpened = !Lampa.Player || typeof Lampa.Player.opened !== 'function' || Lampa.Player.opened();
 
         if (!session || session.destroyed || !playerIsOpened) return;
@@ -725,6 +1381,7 @@
 
         info = getForwardBufferInfo(video, session.hls);
         session.lastBufferInfo = info;
+        virtualInfo = getVirtualBufferInfo(session, info);
 
         if (session.hls) {
             // Если hls.js успел сам уменьшить лимит, сразу возвращаем выбранное пользователем значение.
@@ -734,11 +1391,13 @@
 
             // Если уже был buffer-full, стараемся держать будущее на самом лёгком уровне,
             // пока вперёд не накопится хотя бы заметный запас.
-            if (session.quotaLimited && info.ahead < Math.min(getTargetBufferSeconds(), 240)) {
+            if (session.quotaLimited && virtualInfo.ahead < Math.min(getTargetBufferSeconds(), 240)) {
                 enableLowLevelPrefetch(session, 'quota-limited');
-            } else if (info.ahead > Math.min(getTargetBufferSeconds(), 300)) {
+            } else if (virtualInfo.ahead > Math.min(getTargetBufferSeconds(), 300)) {
                 disableLowLevelPrefetch(session, 'buffer-recovered');
             }
+
+            schedulePrefetch(session, info);
         }
 
         // hls.js можно "будить" даже когда буфер уже почти закончился.
@@ -818,6 +1477,8 @@
             });
         }
 
+        clearSessionCache(session);
+
         state.currentSession = null;
     }
 
@@ -854,6 +1515,7 @@
         }
 
         session = state.currentSession;
+        ensureSessionInternals(session);
         video = getCurrentVideo();
 
         if (!video || typeof video.addEventListener !== 'function' || typeof video.buffered === 'undefined' || typeof video.currentTime === 'undefined') {
@@ -917,6 +1579,7 @@
         registerSettings();
         ensureHlsPatched();
         applyDefaultHlsConfig(window.Hls);
+        patchPlayerInfo();
 
         // Важно: патчим Hls именно на событии start, потому что Lampa создаёт экземпляр hls.js
         // сразу после Player.listener.send('start', data), внутри Video.url(...).
@@ -961,5 +1624,5 @@
         });
     }
 
-    console.log('[Advanced Buffer Control] v1.1.0: file end');
+    console.log('[Advanced Buffer Control] v1.2.0: file end');
 }());
