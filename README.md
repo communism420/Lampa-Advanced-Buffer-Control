@@ -19,7 +19,7 @@
 
 ### Настройка
 
-- **Умное заполнение буфера** — включает или выключает систему адаптивного заполнения буфера.
+- **Плеер → Умное заполнение буфера** — включает или выключает систему адаптивного заполнения буфера.
 - По умолчанию: **включено**.
 
 ---
@@ -43,5 +43,5 @@ The plugin:
 
 ### Setting
 
-- **Smart Buffer Fill** — enables or disables the adaptive buffering system.
+- **Player → Smart Buffer Fill** — enables or disables the adaptive buffering system.
 - Default: **enabled**.
