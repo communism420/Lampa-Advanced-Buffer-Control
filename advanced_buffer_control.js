@@ -1,6 +1,6 @@
 /*
  * Advanced Buffer Control / Умный большой буфер
- * Версия: 3.0.0
+ * Версия: 1.0.0
  *
  * Эта версия делает только то, что реально безопасно на Android / Android TV:
  * - добавляет один переключатель в существующий раздел настроек плеера;
@@ -17,20 +17,20 @@
 (function () {
     'use strict';
 
-    console.log('[Advanced Buffer Control] v3.0.0: file begin');
+    console.log('[Advanced Buffer Control] v1.0.0: file begin');
 
     // Защита от повторной инициализации.
-    if (window.advanced_buffer_control_plugin_ready_v3) {
-        console.log('[Advanced Buffer Control] v3.0.0: already initialized');
-        console.log('[Advanced Buffer Control] v3.0.0: file end');
+    if (window.advanced_buffer_control_plugin_ready_v1) {
+        console.log('[Advanced Buffer Control] v1.0.0: already initialized');
+        console.log('[Advanced Buffer Control] v1.0.0: file end');
         return;
     }
 
-    window.advanced_buffer_control_plugin_ready_v3 = true;
+    window.advanced_buffer_control_plugin_ready_v1 = true;
 
     // Основные идентификаторы плагина и ключи Storage.
     var PLUGIN_NAME = 'Advanced Buffer Control';
-    var PLUGIN_VERSION = '3.0.0';
+    var PLUGIN_VERSION = '1.0.0';
     var ENABLED_KEY = 'advanced_buffer_control_enabled';
     var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
 
@@ -950,5 +950,5 @@
         });
     }
 
-    console.log('[Advanced Buffer Control] v3.0.0: file end');
+    console.log('[Advanced Buffer Control] v1.0.0: file end');
 }());
