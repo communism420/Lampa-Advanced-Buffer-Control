@@ -82,6 +82,7 @@
         started: false,
         settings_installed: false,
         player_wrapped: false,
+        player_listener_bound: false,
         hls_wrapped: false,
         dom_observer: null,
         poll_timer: 0,
@@ -260,6 +261,60 @@
     }
 
     /*
+     * Единое описание параметра настроек, чтобы можно было переиспользовать его
+     * в нескольких разделах настроек при fallback.
+     */
+    function buildSettingsParam() {
+        return {
+            param: {
+                name: STORAGE_KEY,
+                type: 'select',
+                values: buildSettingsValues(),
+                "default": String(DEFAULT_MINUTES)
+            },
+            field: {
+                name: 'Максимальный размер буфера видео',
+                description: 'Сколько минут видео заранее буферизировать (максимум 40 минут)'
+            },
+            onChange: function (value) {
+                var minutes = normalizeMinutes(value);
+
+                setSelectedMinutes(minutes);
+                applyRuntimeSettings('settings-change');
+                scheduleMonitor(150, 'settings-change');
+
+                log('Новое значение буфера:', minutes + ' минут');
+            }
+        };
+    }
+
+    /*
+     * Пробуем добавить настройку в конкретный раздел.
+     * Для совместимости сначала используем встроенные разделы Lampa,
+     * потому что пользовательские разделы отображаются не во всех сборках одинаково.
+     */
+    function tryAddSettingToComponent(component) {
+        var config;
+
+        if (!window.Lampa || !Lampa.SettingsApi || typeof Lampa.SettingsApi.addParam !== 'function') {
+            return false;
+        }
+
+        config = buildSettingsParam();
+        config.component = component;
+
+        try {
+            Lampa.SettingsApi.addParam(config);
+            log('Настройка добавлена в раздел:', component);
+            return true;
+        }
+        catch (e) {
+            log('Не удалось добавить настройку в раздел ' + component + ':', e);
+            return false;
+        }
+    }
+
+    /*
      * Добавляем раздел и параметр в настройки Lampa.
      * Основной современный путь для версий 2025–2026: Lampa.SettingsApi.
      * Сохранение всё равно дублируем через Storage, чтобы не зависеть от деталей реализации.
@@ -272,6 +327,27 @@
             return;
         }
 
+        /*
+         * Сначала пробуем встроенные разделы.
+         * Наиболее логичное место для этой опции — настройки плеера.
+         */
+        if (tryAddSettingToComponent('player')) {
+            state.settings_installed = true;
+            return;
+        }
+
+        /*
+         * Во многих сборках "Остальное" гарантированно существует,
+         * поэтому используем его как запасной вариант.
+         */
+        if (tryAddSettingToComponent('more')) {
+            state.settings_installed = true;
+            return;
+        }
+
+        /*
+         * И только после этого пробуем отдельный пользовательский раздел.
+         */
         try {
             if (typeof Lampa.SettingsApi.addComponent === 'function') {
                 Lampa.SettingsApi.addComponent({
@@ -282,47 +358,15 @@
             }
         }
         catch (e) {
-            /*
-             * Если компонент уже существует, это не критично.
-             * Параметр ниже всё равно попытаемся добавить.
-             */
             log('addComponent пропущен:', e);
         }
 
-        try {
-            Lampa.SettingsApi.addParam({
-                component: COMPONENT_NAME,
-                param: {
-                    name: STORAGE_KEY,
-                    type: 'select',
-                    values: buildSettingsValues(),
-                    default: String(DEFAULT_MINUTES)
-                },
-                field: {
-                    name: 'Максимальный размер буфера видео',
-                    description: 'Сколько минут видео заранее буферизировать (максимум 40 минут)'
-                },
-                onChange: function (value) {
-                    /*
-                     * Значение обязательно нормализуем и сразу применяем к уже открытому плееру,
-                     * чтобы не требовалось перезапускать воспроизведение.
-                     */
-                    var minutes = normalizeMinutes(value);
-
-                    setSelectedMinutes(minutes);
-                    applyRuntimeSettings('settings-change');
-                    scheduleMonitor(150, 'settings-change');
-
-                    log('Новое значение буфера:', minutes + ' минут');
-                }
-            });
-
+        if (tryAddSettingToComponent(COMPONENT_NAME)) {
             state.settings_installed = true;
-            log('Настройка успешно добавлена в меню Lampa');
+            return;
         }
-        catch (e2) {
-            log('Ошибка добавления настройки:', e2);
-        }
+
+        log('Настройку не удалось зарегистрировать ни в одном разделе');
     }
 
     /*
@@ -536,6 +580,43 @@
 
         state.player_wrapped = true;
         log('Lampa.Player.play успешно перехвачен');
+    }
+
+    /*
+     * Дополнительная подписка на события внутреннего listener плеера.
+     * Это нужно как резервный путь для сборок, где перехват Lampa.Player.play
+     * не даёт нужного момента старта или вызывается через другой маршрут.
+     */
+    function bindPlayerListener() {
+        var listener;
+        var events;
+        var i;
+
+        if (state.player_listener_bound) return;
+        if (!window.Lampa || !Lampa.Player || !Lampa.Player.listener) return;
+        if (typeof Lampa.Player.listener.follow !== 'function') return;
+
+        listener = Lampa.Player.listener;
+        events = ['start', 'play', 'loadeddata', 'canplay', 'timeupdate', 'progress'];
+
+        for (i = 0; i < events.length; i++) {
+            (function (eventName) {
+                try {
+                    listener.follow(eventName, function () {
+                        if (eventName === 'start' || eventName === 'play' || eventName === 'loadeddata' || eventName === 'canplay') {
+                            scheduleActivation('player.listener.' + eventName);
+                        }
+                        else {
+                            scheduleMonitor(150, 'player.listener.' + eventName);
+                        }
+                    });
+                }
+                catch (e) {}
+            })(events[i]);
+        }
+
+        state.player_listener_bound = true;
+        log('Lampa.Player.listener успешно подключён');
     }
 
     /*
@@ -1193,6 +1274,7 @@
         installSettings();
         hookHlsConstructor();
         hookPlayer();
+        bindPlayerListener();
         startDomObserver();
         startPoller();
         scheduleActivation('start');
