@@ -2,14 +2,13 @@
 
 ## Русский
 
-**Advanced Buffer Control** — плагин для Lampa, который добавляет умное управление буфером и автоматическое восстановление после decode/media ошибок.
+**Advanced Buffer Control** — плагин для Lampa, который добавляет умное управление буфером для разных типов видео и автоматическое восстановление после decode/media ошибок.
 
 Плагин:
-- автоматически старается заполнить HLS-буфер до фактического предела устройства;
-- отслеживает `bufferFullError` / `bufferAppendingError` и подстраивается под реальный лимит Android / Android TV / WebView;
-- запоминает найденный безопасный предел и использует его при следующих запусках;
+- автоматически старается заполнять буфер как для `hls.js`, так и для обычного `video`-воспроизведения;
+- для `hls.js` отслеживает `bufferFullError` / `bufferAppendingError`, подстраивается под реальный лимит Android / Android TV / WebView и запоминает найденный безопасный предел;
 - при decode/media ошибках сбрасывает буфер, сохраняет текущую позицию и пытается мягко восстановить воспроизведение;
-- работает с `hls.js`, а восстановление после ошибок также рассчитано на обычное `video`-воспроизведение;
+- для `hls.js` использует прямое управление буфером, а для обычного `video` применяет аккуратную принудительную догрузку без жёсткого контроля лимита;
 - добавляет два переключателя в раздел **Настройки → Плеер**.
 
 ### Установка
@@ -29,14 +28,13 @@
 
 ## English
 
-**Advanced Buffer Control** is a Lampa plugin for smart buffering and automatic recovery from decode/media playback errors.
+**Advanced Buffer Control** is a Lampa plugin for smart buffering across different video types and automatic recovery from decode/media playback errors.
 
 The plugin:
-- tries to fill the HLS buffer up to the actual limit of the device;
-- detects `bufferFullError` / `bufferAppendingError` and adapts to the real Android / Android TV / WebView limit;
-- saves the learned safe buffer limit for future playback sessions;
+- tries to keep buffering active for both `hls.js` and regular `video` playback;
+- for `hls.js`, detects `bufferFullError` / `bufferAppendingError`, adapts to the real Android / Android TV / WebView limit, and stores the learned safe limit for future sessions;
 - resets the buffer on decode/media errors, keeps the current position and attempts a smooth playback recovery;
-- works with `hls.js`, while the recovery logic also covers regular `video` playback;
+- uses direct buffer control for `hls.js` and gentle forced re-buffering for regular `video` playback without hard limit control;
 - adds two switches to **Settings → Player**.
 
 ### Installation
