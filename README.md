@@ -8,25 +8,29 @@
 
 ### Что умеет
 
-- Добавляет два переключателя в **Настройки -> Плеер**.
-- Для HLS VOD включает воспроизведение через `hls.js`, если оно доступно.
+- Добавляет три переключателя в **Настройки -> Плеер**.
+- Для `.m3u8`, который не выглядит как live/IPTV, просит Lampa использовать `hls.js`, если он доступен.
 - Для HLS VOD увеличивает целевой буфер, стартуя с 480 секунд.
 - Автоматически учит безопасный предел устройства по `bufferFullError` / `bufferAppendingError`.
 - Запоминает найденный HLS-лимит в `Lampa.Storage` и использует его в следующих сессиях.
 - Держит back-buffer коротким: около 20 секунд позади текущей позиции.
 - При стабильной работе постепенно пробует поднять лимит выше.
+- Опционально удерживает старт воспроизведения, пока не набрано около 15 секунд буфера.
+- Заранее реагирует на риск остановки: учитывает прирост буфера, расход буфера, `waiting` / `stalled` / `suspend` и временно блокирует повышение target.
 - Для обычного `video` включает `preload="auto"` и аккуратно подталкивает загрузку коротким seek только при низком буфере.
 - При decode/media ошибках очищает буфер, сохраняет позицию и пытается восстановить воспроизведение.
 
 ### HLS VOD
 
-Для `.m3u8` потоков плагин сначала проверяет, что это не live/IPTV. Большой буфер применяется только к VOD:
+Для `.m3u8` потоков плагин сначала проверяет, что URL и данные Lampa не выглядят как live/IPTV. Если поток не похож на live и `hls.js` доступен, плагин просит Lampa использовать `hls.js`, чтобы дальше точно определить тип плейлиста.
 
-- поток явно не помечен как `live`, `iptv`, `tv`, `channel` или похожий live URL;
+Большой HLS-буфер включается только после подтверждения VOD:
+
+- у данных Lampa уже есть конечная длительность;
 - либо `hls.js` сообщает, что плейлист не live;
-- либо у видео есть конечная длительность.
+- либо у video появляется конечная длительность.
 
-Если поток оказался live, плагин отключает расширенное буферизование и возвращает обычные настройки `hls.js`.
+Если поток помечен как live/IPTV или позже оказался live, плагин отключает расширенное буферизование и возвращает обычные настройки `hls.js`.
 
 Пределы HLS-буфера:
 
@@ -46,20 +50,38 @@
 - при низком буфере и активном воспроизведении делает короткий seek вперёд-назад, чтобы подтолкнуть догрузку;
 - не делает такие seek, пока пользователь поставил фильм на паузу.
 
+### Предзагрузка перед стартом
+
+Если включён переключатель **Предзагрузка перед стартом**, плагин ставит воспроизведение на паузу в начале сессии и ждёт, пока впереди не будет около 15 секунд буфера.
+
+Это полезно для слабых сетей, где мгновенный старт часто приводит к `waiting` / `stalled`. После набора целевого буфера плагин сам продолжает воспроизведение, если пользователь не остановил его во время предзагрузки.
+
+### Предиктор остановок
+
+Плагин отслеживает, насколько быстро буфер растёт и расходуется. Если буфер тает быстрее, чем загружается, или появляются события `waiting`, `stalled`, `suspend`, он заранее:
+
+- для HLS вызывает дополнительный `startLoad()`;
+- для native video применяет обычный мягкий buffer kick;
+- временно запрещает повышение HLS target, чтобы не усугублять нестабильную сессию.
+
 ### Восстановление после ошибок
 
 Если включён переключатель **Восстановление после decode-ошибок**, плагин пытается восстановиться после decode/media ошибок:
 
-- для HLS вызывает `hls.recoverMediaError()`, снова запускает загрузку и возвращает позицию после готовности seek;
-- для обычного `video` временно сбрасывает `src` / `<source>`, вызывает `load()`, восстанавливает все атрибуты `<source>` и возвращает позицию;
-- не запускает бесконечные циклы восстановления: есть cooldown 7 секунд и максимум 4 попытки до стабильного воспроизведения.
+- для HLS сначала вызывает мягкий `hls.recoverMediaError()`;
+- если ошибка повторяется, переходит к detach/attach media и `startLoad()`;
+- затем пробует полный reload HLS source;
+- последней ступенью пересоздаёт внутреннюю session-обвязку и снова перезагружает источник;
+- для обычного `video` сначала делает мягкий `load()`, затем временно сбрасывает `src` / `<source>`, вызывает `load()`, восстанавливает все атрибуты `<source>` и возвращает позицию;
+- не запускает бесконечные циклы восстановления: максимум 4 ступени до стабильного воспроизведения.
 
 ### Настройки
 
 - **Умное заполнение буфера** — включает или выключает адаптивное заполнение буфера.
+- **Предзагрузка перед стартом** — удерживает старт, пока не набрано около 15 секунд буфера.
 - **Восстановление после decode-ошибок** — включает или выключает восстановление после decode/media ошибок.
 
-Оба переключателя включены по умолчанию.
+Умное заполнение буфера и восстановление включены по умолчанию. Предзагрузка перед стартом выключена по умолчанию.
 
 ### Установка
 
@@ -85,25 +107,29 @@ The plugin does not add an external segment cache and does not replace the `hls.
 
 ### Features
 
-- Adds two switches to **Settings -> Player**.
-- Forces `hls.js` for HLS VOD playback when available.
+- Adds three switches to **Settings -> Player**.
+- Asks Lampa to use `hls.js` for `.m3u8` streams that do not look like live/IPTV, when available.
 - Increases the HLS VOD target buffer, starting from 480 seconds.
 - Learns the safe device limit from `bufferFullError` / `bufferAppendingError`.
 - Stores the learned HLS limit in `Lampa.Storage` and reuses it in later sessions.
 - Keeps the back-buffer short: about 20 seconds behind the current position.
 - Gradually probes higher limits after stable playback.
+- Optionally holds playback start until about 15 seconds are buffered.
+- Predicts stalls by watching buffer growth, buffer drain and `waiting` / `stalled` / `suspend`, then temporarily blocks target probing.
 - For regular `video`, enables `preload="auto"` and gently nudges loading with a short seek only when the buffer is low.
 - On decode/media errors, clears the buffer, keeps the position and attempts playback recovery.
 
 ### HLS VOD
 
-For `.m3u8` streams, the plugin first checks that the stream is not live/IPTV. Large buffering is applied only to VOD:
+For `.m3u8` streams, the plugin first checks that the URL and Lampa play data do not look like live/IPTV. If the stream does not look live and `hls.js` is available, the plugin asks Lampa to use `hls.js` so the playlist type can be detected reliably.
 
-- the stream is not marked as `live`, `iptv`, `tv`, `channel` or a similar live URL;
+Large HLS buffering is enabled only after VOD is confirmed:
+
+- Lampa play data already has a finite duration;
 - or `hls.js` reports that the playlist is not live;
-- or the video has a finite duration.
+- or the video gets a finite duration.
 
-If the stream is detected as live, the plugin disables extended buffering and restores the normal `hls.js` settings.
+If the stream is marked as live/IPTV or later turns out to be live, the plugin disables extended buffering and restores the normal `hls.js` settings.
 
 HLS buffer limits:
 
@@ -123,20 +149,38 @@ Instead it:
 - when playback is active and the buffer is low, performs a short forward/back seek to nudge loading;
 - skips this seek while the user has paused playback.
 
+### Prebuffer Before Start
+
+When **Prebuffer Before Start** is enabled, the plugin pauses playback at the beginning of a session and waits until roughly 15 seconds are buffered ahead.
+
+This is useful on weak networks where instant playback often leads to `waiting` / `stalled`. Once the target buffer is reached, playback resumes automatically unless the user paused it during prebuffering.
+
+### Stall Predictor
+
+The plugin tracks how quickly the buffer grows and drains. If the buffer is draining faster than it loads, or `waiting`, `stalled`, `suspend` events appear, it proactively:
+
+- calls an extra `startLoad()` for HLS;
+- uses the regular soft buffer kick for native video;
+- temporarily blocks HLS target increases so an unstable session is not pushed harder.
+
 ### Error Recovery
 
 When **Decode Error Recovery** is enabled, the plugin tries to recover from decode/media errors:
 
-- for HLS, it calls `hls.recoverMediaError()`, restarts loading and restores the position once seeking is ready;
-- for regular `video`, it temporarily clears `src` / `<source>`, calls `load()`, restores all `<source>` attributes and returns to the saved position;
-- it avoids endless recovery loops with a 7-second cooldown and a maximum of 4 attempts before stable playback.
+- for HLS, it first calls soft `hls.recoverMediaError()`;
+- if errors repeat, it escalates to media detach/attach plus `startLoad()`;
+- then it tries a full HLS source reload;
+- as the last step, it recreates the internal session wrapper and reloads the source again;
+- for regular `video`, it starts with a soft `load()`, then temporarily clears `src` / `<source>`, calls `load()`, restores all `<source>` attributes and returns to the saved position;
+- it avoids endless recovery loops with a maximum of 4 stages before stable playback.
 
 ### Settings
 
 - **Smart Buffer Fill** — enables or disables adaptive buffering.
+- **Prebuffer Before Start** — holds playback start until about 15 seconds are buffered.
 - **Decode Error Recovery** — enables or disables recovery from decode/media errors.
 
-Both switches are enabled by default.
+Smart buffering and recovery are enabled by default. Prebuffer before start is disabled by default.
 
 ### Installation
 
