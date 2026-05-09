@@ -96,8 +96,12 @@ var PLUGIN_VERSION = '1.2.0';
     var RECOVERY_NATIVE_RELOAD_DELAY_MS = 120;
     var RECOVERY_MAX_ATTEMPTS = 4;
     var RECOVERY_STABLE_RESET_MS = 15000;
-    var HLS_NETWORK_RETRY_BASE_MS = 1500;
-    var HLS_NETWORK_RETRY_MAX_MS = 15000;
+    var HLS_NETWORK_RETRY_BASE_MS = 750;
+    var HLS_NETWORK_RETRY_MAX_MS = 5000;
+    var HLS_NETWORK_SAFE_TARGET_SEC = 60;
+    var HLS_NETWORK_CRITICAL_TARGET_SEC = 30;
+    var HLS_NETWORK_LOW_BUFFER_RETRY_SEC = 25;
+    var HLS_NETWORK_RECOVERY_HOLD_MS = 120000;
     var HLS_BUFFER_CONFIG_FIELDS = [
         'maxBufferLength',
         'maxMaxBufferLength',
@@ -551,6 +555,17 @@ var PLUGIN_VERSION = '1.2.0';
         return getInitialTargetSec();
     }
 
+    function getEffectiveHlsTargetSec(session) {
+        var target = getCurrentDesiredTargetSec(session);
+        var now = Date.now();
+
+        if (session && session.hlsNetworkTargetSec && session.hlsNetworkLimitUntil && now < session.hlsNetworkLimitUntil) {
+            target = Math.min(target, session.hlsNetworkTargetSec);
+        }
+
+        return roundToSafeStep(target);
+    }
+
     // Применяем дефолтный конфиг hls.js в зависимости от статуса переключателя.
     function applyDefaultHlsConfig(HlsCtor, playData) {
         var targetSec;
@@ -576,7 +591,7 @@ var PLUGIN_VERSION = '1.2.0';
                 state.defaultHlsDefaultsBeforeApply = readHlsBufferConfig(HlsCtor.DefaultConfig);
             }
 
-            targetSec = getCurrentDesiredTargetSec(
+            targetSec = getEffectiveHlsTargetSec(
                 state.currentSession && state.currentSession.playData === playData ? state.currentSession : null
             );
 
@@ -615,7 +630,7 @@ var PLUGIN_VERSION = '1.2.0';
                 hls.__advancedBufferRuntimeConfig = state.defaultHlsDefaultsBeforeApply || readHlsBufferConfig(hls.config);
             }
 
-            targetSec = getCurrentDesiredTargetSec(session);
+            targetSec = getEffectiveHlsTargetSec(session);
 
             hls.config.maxBufferLength = targetSec;
             hls.config.maxMaxBufferLength = targetSec;
@@ -1003,7 +1018,9 @@ var PLUGIN_VERSION = '1.2.0';
                 hlsNetworkRetryTimer: null,
                 hlsNetworkRetryCount: 0,
                 lastHlsNetworkRetryAt: 0,
-                lastHlsNetworkErrorReason: ''
+                lastHlsNetworkErrorReason: '',
+                hlsNetworkTargetSec: 0,
+                hlsNetworkLimitUntil: 0
             };
         }
 
@@ -1160,6 +1177,8 @@ var PLUGIN_VERSION = '1.2.0';
         session.hlsNetworkRetryCount = 0;
         session.lastHlsNetworkRetryAt = 0;
         session.lastHlsNetworkErrorReason = '';
+        session.hlsNetworkTargetSec = 0;
+        session.hlsNetworkLimitUntil = 0;
     }
 
     function markStablePlayback(session) {
@@ -1182,6 +1201,16 @@ var PLUGIN_VERSION = '1.2.0';
             session.hlsNetworkRetryCount = 0;
             session.lastHlsNetworkRetryAt = 0;
             session.lastHlsNetworkErrorReason = '';
+        }
+
+        if (session.hlsNetworkTargetSec && session.hlsNetworkLimitUntil && Date.now() >= session.hlsNetworkLimitUntil) {
+            session.hlsNetworkTargetSec = 0;
+            session.hlsNetworkLimitUntil = 0;
+
+            if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
+                applyHlsRuntimeConfig(session.hls, session);
+                log('hls network target cap released, target =', session.targetSec);
+            }
         }
     }
 
@@ -1844,6 +1873,7 @@ var PLUGIN_VERSION = '1.2.0';
 
     function getHlsNetworkRetryDelay(session, reason) {
         var count;
+        var info;
 
         if (!session) return HLS_NETWORK_RETRY_BASE_MS;
 
@@ -1852,7 +1882,47 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         count = Math.max(0, session.hlsNetworkRetryCount || 0);
-        return Math.min(HLS_NETWORK_RETRY_MAX_MS, HLS_NETWORK_RETRY_BASE_MS * Math.pow(2, count));
+
+        try {
+            info = getForwardBufferInfo(session.video || getCurrentVideo(), session.hls);
+
+            if (info && info.ahead <= HLS_NETWORK_LOW_BUFFER_RETRY_SEC) {
+                return 0;
+            }
+        } catch (e) {
+            // Без данных о буфере используем обычный backoff.
+        }
+
+        if (count <= 0) return 0;
+
+        return Math.min(HLS_NETWORK_RETRY_MAX_MS, HLS_NETWORK_RETRY_BASE_MS * Math.pow(2, count - 1));
+    }
+
+    function capHlsTargetAfterNetworkError(session, reason) {
+        var now = Date.now();
+        var retryCount;
+        var cap;
+
+        if (!session || !session.hls || !shouldUseBufferingForPlayData(session.playData)) return;
+
+        retryCount = Math.max(0, session.hlsNetworkRetryCount || 0);
+        cap = retryCount >= 2 ? HLS_NETWORK_CRITICAL_TARGET_SEC : HLS_NETWORK_SAFE_TARGET_SEC;
+
+        session.hlsNetworkTargetSec = roundToSafeStep(Math.min(session.targetSec || getInitialTargetSec(), cap));
+        session.hlsNetworkLimitUntil = now + HLS_NETWORK_RECOVERY_HOLD_MS;
+        session.predictorHoldProbeUntil = Math.max(session.predictorHoldProbeUntil || 0, session.hlsNetworkLimitUntil);
+        session.lastProbeAt = now;
+
+        applyHlsRuntimeConfig(session.hls, session);
+
+        log('hls target capped after network error, reason =', reason || 'unknown', 'cap =', session.hlsNetworkTargetSec);
+    }
+
+    function markHlsNetworkProgress(session) {
+        if (!session) return;
+
+        session.hlsNetworkRetryCount = 0;
+        session.lastHlsNetworkErrorReason = '';
     }
 
     function restartHlsNetworkLoad(session, reason) {
@@ -1870,6 +1940,7 @@ var PLUGIN_VERSION = '1.2.0';
             if (video) session.video = video;
 
             syncHlsPlaylistTypeFromState(session, reason + ':network-retry-state');
+            capHlsTargetAfterNetworkError(session, reason);
 
             if (shouldUseBufferingForPlayData(session.playData)) {
                 applyHlsRuntimeConfig(hls, session);
@@ -1901,6 +1972,8 @@ var PLUGIN_VERSION = '1.2.0';
         session.hls = getCurrentHls(session.video || getCurrentVideo()) || session.hls;
 
         if (!session.hls) return;
+        capHlsTargetAfterNetworkError(session, reason || 'hls-network');
+
         if (session.hlsNetworkRetryTimer) return;
 
         delay = getHlsNetworkRetryDelay(session, reason);
@@ -2563,6 +2636,7 @@ var PLUGIN_VERSION = '1.2.0';
             },
             fragBuffered: function () {
                 syncHlsPlaylistTypeFromState(session, 'hls-frag-buffered');
+                markHlsNetworkProgress(session);
                 evaluateSession('hls-frag-buffered');
             },
             error: function (event, data) {
