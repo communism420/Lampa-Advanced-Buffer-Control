@@ -79,6 +79,11 @@ var PLUGIN_VERSION = '1.2.0';
     var LOW_BUFFER_THRESHOLD_SEC = 55;
     var WATCHDOG_INTERVAL = 2000;
     var STARTLOAD_COOLDOWN = 7000;
+    var HLS_KEEPER_COOLDOWN_MS = 1500;
+    var HLS_KEEPER_TARGET_MARGIN_SEC = 5;
+    var HLS_KEEPER_STALLED_MS = 15000;
+    var HLS_KEEPER_STOPSTART_COOLDOWN_MS = 12000;
+    var HLS_KEEPER_LOG_INTERVAL_MS = 15000;
     var BACK_BUFFER_KEEP_SEC = 20;
     var BACK_BUFFER_LEARN_POSTPONE_MAX = 1;
     var NATIVE_LOW_BUFFER_THRESHOLD_SEC = 18;
@@ -1027,7 +1032,12 @@ var PLUGIN_VERSION = '1.2.0';
                 hlsNetworkLimitUntil: 0,
                 hlsNetworkSuccessCount: 0,
                 lastHlsNetworkProgressAt: 0,
-                lastHlsNetworkRampAt: 0
+                lastHlsNetworkRampAt: 0,
+                lastHlsKeeperAt: 0,
+                lastHlsKeeperLogAt: 0,
+                lastHlsBufferEnd: 0,
+                lastHlsBufferGrowthAt: 0,
+                lastHlsSoftRestartAt: 0
             };
         }
 
@@ -1189,6 +1199,11 @@ var PLUGIN_VERSION = '1.2.0';
         session.hlsNetworkSuccessCount = 0;
         session.lastHlsNetworkProgressAt = 0;
         session.lastHlsNetworkRampAt = 0;
+        session.lastHlsKeeperAt = 0;
+        session.lastHlsKeeperLogAt = 0;
+        session.lastHlsBufferEnd = 0;
+        session.lastHlsBufferGrowthAt = 0;
+        session.lastHlsSoftRestartAt = 0;
     }
 
     function markStablePlayback(session) {
@@ -2486,6 +2501,99 @@ var PLUGIN_VERSION = '1.2.0';
         }
     }
 
+    function getDesiredHlsAheadSec(session) {
+        var video;
+        var target;
+        var current;
+        var duration;
+        var remaining;
+
+        if (!session) return 0;
+
+        video = session.video;
+        target = getEffectiveHlsTargetSec(session);
+
+        if (!video) return target;
+
+        current = toNumber(video.currentTime, 0);
+        duration = toNumber(video.duration, 0);
+
+        if (isFinite(duration) && duration > 0) {
+            remaining = duration - current;
+            if (remaining <= 3) return 0;
+            target = Math.min(target, Math.max(0, remaining - 2));
+        }
+
+        return target;
+    }
+
+    function updateHlsBufferGrowth(session, info) {
+        var now;
+
+        if (!session || !session.hls || !info) return;
+
+        now = Date.now();
+
+        if (!session.lastHlsBufferGrowthAt) {
+            session.lastHlsBufferGrowthAt = now;
+        }
+
+        if (!session.lastHlsBufferEnd || info.end > session.lastHlsBufferEnd + 0.25) {
+            session.lastHlsBufferEnd = info.end;
+            session.lastHlsBufferGrowthAt = now;
+        }
+    }
+
+    function keepHlsBufferFilling(session, info, reason) {
+        var hls;
+        var now;
+        var desiredAhead;
+        var currentTime;
+        var noGrowthFor;
+        var shouldSoftRestart;
+
+        if (!session || session.destroyed || !session.video || !session.hls || !info) return;
+        if (!shouldUseBufferingForPlayData(session.playData)) return;
+
+        hls = session.hls;
+        if (typeof hls.startLoad !== 'function') return;
+
+        desiredAhead = getDesiredHlsAheadSec(session);
+        if (desiredAhead <= 0) return;
+        if (info.ahead >= Math.max(0, desiredAhead - HLS_KEEPER_TARGET_MARGIN_SEC)) return;
+
+        now = Date.now();
+        if (now - session.lastHlsKeeperAt < HLS_KEEPER_COOLDOWN_MS) return;
+
+        currentTime = toNumber(session.video.currentTime, -1);
+        noGrowthFor = session.lastHlsBufferGrowthAt ? now - session.lastHlsBufferGrowthAt : 0;
+        shouldSoftRestart = noGrowthFor >= HLS_KEEPER_STALLED_MS &&
+            now - session.lastHlsSoftRestartAt >= HLS_KEEPER_STOPSTART_COOLDOWN_MS &&
+            typeof hls.stopLoad === 'function';
+
+        try {
+            applyHlsRuntimeConfig(hls, session);
+
+            if (shouldSoftRestart) {
+                hls.stopLoad();
+                session.lastHlsSoftRestartAt = now;
+                session.lastStartLoadAt = 0;
+                log('hls loader soft restart, reason =', reason || 'keeper', 'ahead =', info.ahead, 'target =', desiredAhead);
+            }
+
+            hls.startLoad(currentTime);
+            session.lastHlsKeeperAt = now;
+            session.lastStartLoadAt = now;
+
+            if (shouldSoftRestart || now - session.lastHlsKeeperLogAt >= HLS_KEEPER_LOG_INTERVAL_MS) {
+                session.lastHlsKeeperLogAt = now;
+                log('hls buffer keeper startLoad, reason =', reason || 'keeper', 'ahead =', info.ahead, 'target =', desiredAhead, 'paused =', !!session.video.paused);
+            }
+        } catch (e) {
+            warn('hls buffer keeper failed', e);
+        }
+    }
+
     // Когда устройство упёрлось в bufferFullError, вычисляем безопасный предел и запоминаем его.
     function learnDeviceLimit(session, reason) {
         var info;
@@ -2844,6 +2952,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         info = getForwardBufferInfo(video, session.hls);
         session.lastBufferInfo = info;
+        updateHlsBufferGrowth(session, info);
 
         if (info.ahead > session.observedMaxAhead) {
             session.observedMaxAhead = info.ahead;
@@ -2856,6 +2965,8 @@ var PLUGIN_VERSION = '1.2.0';
         if (maintainPrebuffer(session, info, reason || 'evaluate')) {
             return;
         }
+
+        keepHlsBufferFilling(session, info, reason || 'evaluate');
 
         updateStallPredictor(session, info, reason || 'evaluate');
 
