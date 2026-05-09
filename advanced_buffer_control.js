@@ -5,7 +5,6 @@
  * Эта версия делает только то, что реально безопасно на Android / Android TV:
  * - добавляет переключатели в существующий раздел настроек плеера;
  * - если плагин включён, то старается заполнять буфер не только для HLS, но и для обычного video-воспроизведения;
- * - при decode/media ошибках умеет сбросить буфер в ноль, сохранить позицию и мягко восстановить воспроизведение;
  * - предел определяется автоматически по non-fatal ошибкам bufferFullError / bufferAppendingError;
  * - найденный предел запоминается в Storage и используется на следующих запусках;
  * - при стабильном воспроизведении плагин понемногу пробует поднять предел выше, чтобы адаптироваться под конкретное устройство.
@@ -34,7 +33,6 @@ console.log('[Advanced Buffer Control] v1.2.0: file begin');
 var PLUGIN_VERSION = '1.2.0';
     var ENABLED_KEY = 'advanced_buffer_control_enabled';
     var PREBUFFER_ENABLED_KEY = 'advanced_buffer_control_prebuffer_enabled';
-    var RECOVERY_ENABLED_KEY = 'advanced_buffer_control_decode_recovery_enabled';
     var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
     var LEARNED_LIMIT_MIGRATION_KEY = 'advanced_buffer_control_learned_limit_migration_v120';
     var MENU_TEXT = {
@@ -53,21 +51,12 @@ var PLUGIN_VERSION = '1.2.0';
         prebuffer_description: {
             ru: 'Не начинать воспроизведение, пока не набрано около 15 секунд буфера',
             en: 'Do not start playback until about 15 seconds are buffered'
-        },
-        recovery_name: {
-            ru: 'Восстановление после decode-ошибок',
-            en: 'Decode Error Recovery'
-        },
-        recovery_description: {
-            ru: 'При decode/media ошибках сбрасывать буфер, сохранять позицию и мягко перезапускать воспроизведение',
-            en: 'On decode/media errors, reset the buffer, keep the position and gently restart playback'
         }
     };
 
     // Значения по умолчанию и безопасные пределы.
     var ENABLED_DEFAULT = true;
     var PREBUFFER_ENABLED_DEFAULT = false;
-    var RECOVERY_ENABLED_DEFAULT = true;
     var MIN_TARGET_SEC = 15;
     var PREBUFFER_TARGET_SEC = 15;
     var DISCOVERY_START_SEC = 480;
@@ -98,14 +87,6 @@ var PLUGIN_VERSION = '1.2.0';
     var STALL_PREDICTOR_ACTION_COOLDOWN_MS = 5000;
     var STALL_SIGNAL_WINDOW_MS = 15000;
     var PREBUFFER_INTERNAL_PAUSE_GUARD_MS = 300;
-    var RECOVERY_ATTACH_TIMEOUT_MS = 2500;
-    var RECOVERY_SEEK_READY_TIMEOUT_MS = 1500;
-    var RECOVERY_NATIVE_RELOAD_DELAY_MS = 120;
-    var RECOVERY_MAX_ATTEMPTS = 4;
-    var RECOVERY_STABLE_RESET_MS = 15000;
-    var HLS_NETWORK_RETRY_BASE_MS = 750;
-    var HLS_NETWORK_RETRY_MAX_MS = 5000;
-    var HLS_NETWORK_LOW_BUFFER_RETRY_SEC = 25;
     var HLS_LOW_LEARNED_LIMIT_HOLD_MS = 120000;
     var HLS_CEILING_EXPAND_INTERVAL_MS = 5000;
     var HLS_CEILING_EXPAND_MARGIN_SEC = 8;
@@ -230,22 +211,9 @@ var PLUGIN_VERSION = '1.2.0';
         return String(value) === 'true';
     }
 
-    // Текущий статус автоматического восстановления после decode/media ошибок.
-    function isRecoveryEnabled() {
-        var value;
-
-        try {
-            value = Lampa.Storage.get(RECOVERY_ENABLED_KEY, RECOVERY_ENABLED_DEFAULT);
-        } catch (e) {
-            value = RECOVERY_ENABLED_DEFAULT;
-        }
-
-        return String(value) === 'true';
-    }
-
     // Проверяем, включена ли хотя бы одна функция плагина.
     function isAnyFeatureEnabled() {
-        return isPluginEnabled() || isPrebufferEnabled() || isRecoveryEnabled();
+        return isPluginEnabled() || isPrebufferEnabled();
     }
 
     // Читаем запомненный безопасный предел устройства.
@@ -416,14 +384,6 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         try {
-            if (Lampa.Storage.get(RECOVERY_ENABLED_KEY, null) === null) {
-                Lampa.Storage.set(RECOVERY_ENABLED_KEY, RECOVERY_ENABLED_DEFAULT);
-            }
-        } catch (e1) {
-            warn('failed to normalize recovery flag', e1);
-        }
-
-        try {
             storedMigration = String(Lampa.Storage.get(LEARNED_LIMIT_MIGRATION_KEY, '') || '');
             storedLimit = toNumber(Lampa.Storage.get(LEARNED_LIMIT_KEY, 0), 0);
 
@@ -470,7 +430,7 @@ var PLUGIN_VERSION = '1.2.0';
             onChange: function (value) {
                 var enabled = String(value) === 'true';
 
-                if (!enabled && !isRecoveryEnabled()) {
+                if (!enabled) {
                     state.startToken += 1;
                     destroyCurrentSession();
                 }
@@ -490,25 +450,6 @@ var PLUGIN_VERSION = '1.2.0';
             field: createLocalizedField('prebuffer_name', 'prebuffer_description'),
             onChange: function () {
                 syncCurrentSession('prebuffer-settings-change');
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'player',
-            param: {
-                name: RECOVERY_ENABLED_KEY,
-                type: 'trigger',
-                default: RECOVERY_ENABLED_DEFAULT
-            },
-            field: createLocalizedField('recovery_name', 'recovery_description'),
-            onChange: function () {
-                if (!isAnyFeatureEnabled()) {
-                    state.startToken += 1;
-                    destroyCurrentSession();
-                    return;
-                }
-
-                syncCurrentSession('recovery-settings-change');
             }
         });
     }
@@ -668,16 +609,8 @@ var PLUGIN_VERSION = '1.2.0';
 
         Lampa.PlayerVideo.listener.follow('error', function (e) {
             var text;
-            var session;
 
             text = String(e.error || '');
-
-            if (isRecoveryEnabled() && isRecoverablePlayerError(e)) {
-                session = ensureSession();
-                session.video = session.video || getCurrentVideo();
-                session.hls = getCurrentHls(session.video) || session.hls;
-                requestDecodeRecovery(session, 'player-listener:' + text);
-            }
 
             if (!isPluginEnabled()) return;
             if (!e || e.fatal) return;
@@ -894,85 +827,7 @@ var PLUGIN_VERSION = '1.2.0';
         }
     }
 
-    function captureElementAttributes(node) {
-        var attrs = [];
-        var i;
-        var attr;
-
-        if (!node || !node.attributes) return attrs;
-
-        for (i = 0; i < node.attributes.length; i++) {
-            attr = node.attributes[i];
-            attrs.push({
-                name: attr.name,
-                value: attr.value
-            });
-        }
-
-        return attrs;
-    }
-
-    // Снимок <source>-элементов нужен для жёсткой перезагрузки нативного video.
-    function captureVideoSources(video) {
-        var result = [];
-
-        if (!video || !video.querySelectorAll) return result;
-
-        try {
-            Array.prototype.forEach.call(video.querySelectorAll('source'), function (node) {
-                result.push({
-                    src: node.getAttribute('src') || '',
-                    type: node.getAttribute('type') || '',
-                    attributes: captureElementAttributes(node)
-                });
-            });
-        } catch (e) {
-            warn('failed to capture <source> nodes', e);
-        }
-
-        return result;
-    }
-
-    // Полностью убираем source-узлы, чтобы video.load() реально обнулил текущий буфер.
-    function clearVideoSources(video) {
-        if (!video || !video.querySelectorAll) return;
-
-        try {
-            Array.prototype.forEach.call(video.querySelectorAll('source'), function (node) {
-                if (node && node.parentNode) {
-                    node.parentNode.removeChild(node);
-                }
-            });
-        } catch (e) {
-            warn('failed to clear <source> nodes', e);
-        }
-    }
-
-    // Возвращаем source-узлы после жёсткой перезагрузки video.
-    function restoreVideoSources(video, sources) {
-        if (!video || !sources || !sources.length) return;
-
-        try {
-            sources.forEach(function (item) {
-                var sourceNode = document.createElement('source');
-
-                if (item.attributes && item.attributes.length) {
-                    item.attributes.forEach(function (attr) {
-                        if (attr && attr.name) sourceNode.setAttribute(attr.name, attr.value);
-                    });
-                } else {
-                    if (item.src) sourceNode.setAttribute('src', item.src);
-                    if (item.type) sourceNode.setAttribute('type', item.type);
-                }
-
-                video.appendChild(sourceNode);
-            });
-        } catch (e) {
-            warn('failed to restore <source> nodes', e);
-        }
-    }
-
-    // Нормализуем сессию, даже если recover нужно вызвать раньше, чем успел полностью подняться hls.js.
+    // Нормализуем сессию для текущего запуска плеера.
     function ensureSession(playData) {
         if (!state.currentSession || state.currentSession.destroyed) {
             state.currentSession = {
@@ -1013,13 +868,7 @@ var PLUGIN_VERSION = '1.2.0';
                 hlsHandlers: null,
                 bound: false,
                 boundVideo: null,
-                recoveryInProgress: false,
-                recoveryStage: 0,
-                recoveryAttempts: 0,
-                lastRecoveryAt: 0,
-                lastRecoveryReason: '',
                 lastStablePlaybackAt: 0,
-                nativeRecoveryJustReloaded: false,
                 nativeKickInProgress: false,
                 nativeKickReturnTo: null,
                 nativeKickHadOwnRewind: false,
@@ -1028,16 +877,6 @@ var PLUGIN_VERSION = '1.2.0';
                 lastNativeProgressAt: 0,
                 nativeKickReturnTimer: null,
                 nativeKickReleaseTimer: null,
-                recoveryFinalizeTimer: null,
-                recoveryTimeoutTimer: null,
-                recoveryReloadTimer: null,
-                recoveryNativeTimeoutTimer: null,
-                recoverySeekReadyCleanup: null,
-                hlsNetworkRetryTimer: null,
-                hlsNetworkRetryCount: 0,
-                lastHlsNetworkRetryAt: 0,
-                lastHlsNetworkErrorReason: '',
-                lastHlsNetworkProgressAt: 0,
                 lastHlsKeeperAt: 0,
                 lastHlsKeeperLogAt: 0,
                 lastHlsBufferEnd: 0,
@@ -1144,175 +983,28 @@ var PLUGIN_VERSION = '1.2.0';
             session.nativeKickReleaseTimer = null;
         }
 
-        if (session.recoveryFinalizeTimer) {
-            clearTimeout(session.recoveryFinalizeTimer);
-            session.recoveryFinalizeTimer = null;
-        }
-
-        if (session.recoveryTimeoutTimer) {
-            clearTimeout(session.recoveryTimeoutTimer);
-            session.recoveryTimeoutTimer = null;
-        }
-
-        if (session.recoveryReloadTimer) {
-            clearTimeout(session.recoveryReloadTimer);
-            session.recoveryReloadTimer = null;
-        }
-
-        if (session.recoveryNativeTimeoutTimer) {
-            clearTimeout(session.recoveryNativeTimeoutTimer);
-            session.recoveryNativeTimeoutTimer = null;
-        }
-
-        if (session.hlsNetworkRetryTimer) {
-            clearTimeout(session.hlsNetworkRetryTimer);
-            session.hlsNetworkRetryTimer = null;
-        }
-
         if (session.prebufferPauseGuardTimer) {
             clearTimeout(session.prebufferPauseGuardTimer);
             session.prebufferPauseGuardTimer = null;
-        }
-
-        if (session.recoverySeekReadyCleanup) {
-            try {
-                session.recoverySeekReadyCleanup();
-            } catch (e) {
-                // На cleanup это не критично.
-            }
-            session.recoverySeekReadyCleanup = null;
         }
 
         session.nativeKickInProgress = false;
         session.nativeKickReturnTo = null;
         session.prebufferInProgress = false;
         session.prebufferInternalPause = false;
-        session.recoveryInProgress = false;
-        session.nativeRecoveryJustReloaded = false;
-    }
-
-    // Сбрасываем счётчик recover-циклов после стабильного воспроизведения.
-    function resetRecoveryAttemptsIfStable(session) {
-        if (!session || !session.recoveryAttempts || !session.lastRecoveryAt) return;
-        if (!session.lastStablePlaybackAt || session.lastStablePlaybackAt < session.lastRecoveryAt) return;
-        if (Date.now() - session.lastStablePlaybackAt < RECOVERY_STABLE_RESET_MS) return;
-
-        session.recoveryAttempts = 0;
-        session.recoveryStage = 0;
-        session.lastRecoveryAt = 0;
-        session.lastRecoveryReason = '';
-        session.hlsNetworkRetryCount = 0;
-        session.lastHlsNetworkRetryAt = 0;
-        session.lastHlsNetworkErrorReason = '';
-        session.lastHlsNetworkProgressAt = 0;
-        session.lastHlsKeeperAt = 0;
-        session.lastHlsKeeperLogAt = 0;
-        session.lastHlsBufferEnd = 0;
-        session.lastHlsBufferGrowthAt = 0;
-        session.lastHlsSoftRestartAt = 0;
-        session.lastHlsCeilingExpandAt = 0;
-        session.hlsKeeperStallCount = 0;
-        session.hlsLevelCapBeforeKeeper = null;
-        session.hlsLevelCapApplied = false;
-        session.hlsLevelProgressCount = 0;
     }
 
     function markStablePlayback(session) {
         var video;
 
-        if (!session || session.recoveryInProgress) return;
+        if (!session) return;
 
         video = session.video;
         if (video && (video.paused || video.seeking || video.ended)) return;
 
-        if (!session.lastStablePlaybackAt ||
-            (session.lastRecoveryAt && session.lastStablePlaybackAt < session.lastRecoveryAt) ||
-            (session.lastHlsNetworkRetryAt && session.lastStablePlaybackAt < session.lastHlsNetworkRetryAt)) {
+        if (!session.lastStablePlaybackAt) {
             session.lastStablePlaybackAt = Date.now();
         }
-
-        if (session.lastHlsNetworkRetryAt &&
-            session.lastStablePlaybackAt >= session.lastHlsNetworkRetryAt &&
-            Date.now() - session.lastStablePlaybackAt >= RECOVERY_STABLE_RESET_MS) {
-            session.hlsNetworkRetryCount = 0;
-            session.lastHlsNetworkRetryAt = 0;
-            session.lastHlsNetworkErrorReason = '';
-        }
-    }
-
-    // Определяем классические decode/media ошибки нативного <video>.
-    function isNativeDecodeError(error) {
-        var message;
-
-        if (!error) return false;
-        if (error.code === 3) return true;
-
-        message = String(error.message || '').toLowerCase();
-
-        return message.indexOf('decode') >= 0 ||
-            message.indexOf('corrupt') >= 0 ||
-            message.indexOf('mediasource') >= 0 ||
-            message.indexOf('sourcebuffer') >= 0;
-    }
-
-    // Определяем ошибки, пришедшие через общий listener Lampa.PlayerVideo.
-    function isRecoverablePlayerError(eventData) {
-        var text = String((eventData && eventData.error) || '').toLowerCase();
-        var fatal = !!(eventData && eventData.fatal);
-
-        if (!text) return false;
-
-        return text.indexOf('code [3]') >= 0 ||
-            text.indexOf('decode') >= 0 ||
-            text.indexOf('media error') >= 0 ||
-            text.indexOf('mediasourcerequiresreset') >= 0 ||
-            text.indexOf('bufferaddcodecerror') >= 0 ||
-            text.indexOf('bufferincompatiblecodecserror') >= 0 ||
-            (fatal && text.indexOf('bufferappenderror') >= 0) ||
-            (fatal && text.indexOf('bufferappendingerror') >= 0) ||
-            (fatal && text.indexOf('fragparsingerror') >= 0);
-    }
-
-    // Определяем decode/media ошибки hls.js, которые разумно лечить полным сбросом буфера.
-    function isRecoverableHlsError(data, HlsCtor) {
-        var details;
-
-        if (!data || !HlsCtor || !HlsCtor.ErrorDetails) return false;
-
-        details = data.details;
-
-        if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && data.fatal) {
-            return true;
-        }
-
-        return details === HlsCtor.ErrorDetails.BUFFER_ADD_CODEC_ERROR ||
-            details === HlsCtor.ErrorDetails.BUFFER_INCOMPATIBLE_CODECS_ERROR ||
-            details === HlsCtor.ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET ||
-            (data.fatal && details === HlsCtor.ErrorDetails.BUFFER_APPEND_ERROR) ||
-            (data.fatal && details === HlsCtor.ErrorDetails.BUFFER_APPENDING_ERROR) ||
-            (data.fatal && details === HlsCtor.ErrorDetails.FRAG_PARSING_ERROR) ||
-            (data.fatal && details === HlsCtor.ErrorDetails.INTERNAL_EXCEPTION);
-    }
-
-    function isRecoverableHlsNetworkError(data, HlsCtor) {
-        var details;
-        var ErrorDetails;
-
-        if (!data || !data.fatal || !HlsCtor || !HlsCtor.ErrorDetails) return false;
-
-        ErrorDetails = HlsCtor.ErrorDetails;
-        details = data.details;
-
-        if (HlsCtor.ErrorTypes && data.type === HlsCtor.ErrorTypes.NETWORK_ERROR) return true;
-
-        return details === ErrorDetails.FRAG_LOAD_ERROR ||
-            details === ErrorDetails.FRAG_LOAD_TIMEOUT ||
-            details === ErrorDetails.LEVEL_LOAD_ERROR ||
-            details === ErrorDetails.LEVEL_LOAD_TIMEOUT ||
-            details === ErrorDetails.MANIFEST_LOAD_ERROR ||
-            details === ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
-            details === ErrorDetails.KEY_LOAD_ERROR ||
-            details === ErrorDetails.KEY_LOAD_TIMEOUT;
     }
 
     function collectHlsDetailsCandidates(hls) {
@@ -1393,565 +1085,6 @@ var PLUGIN_VERSION = '1.2.0';
         return false;
     }
 
-    function canRestoreTimeNow(video, time) {
-        if (!video || !isFinite(time) || time <= 0.25) return true;
-        return video.readyState >= 1;
-    }
-
-    function waitForRecoverSeekReady(session, video, currentTime, wasPaused, reason) {
-        var completed = false;
-        var events = ['loadedmetadata', 'durationchange', 'canplay'];
-        var handler;
-
-        if (!session || !video) return;
-
-        function cleanup() {
-            events.forEach(function (eventName) {
-                try {
-                    video.removeEventListener(eventName, handler);
-                } catch (e) {
-                    // На cleanup это не критично.
-                }
-            });
-
-            if (session.recoveryFinalizeTimer) {
-                clearTimeout(session.recoveryFinalizeTimer);
-                session.recoveryFinalizeTimer = null;
-            }
-
-            if (session.recoverySeekReadyCleanup === cleanup) {
-                session.recoverySeekReadyCleanup = null;
-            }
-        }
-
-        function complete(tag) {
-            if (completed) return;
-            completed = true;
-            cleanup();
-            completeDecodeRecovery(session, currentTime, wasPaused, reason + ':' + tag);
-        }
-
-        handler = function () {
-            complete('seek-ready');
-        };
-
-        session.recoverySeekReadyCleanup = cleanup;
-
-        events.forEach(function (eventName) {
-            try {
-                video.addEventListener(eventName, handler);
-            } catch (e) {
-                // Старые WebView могут не дать повесить редкие события.
-            }
-        });
-
-        session.recoveryFinalizeTimer = setTimeout(function () {
-            complete('seek-timeout');
-        }, RECOVERY_SEEK_READY_TIMEOUT_MS);
-    }
-
-    function startDecodeRecoveryLoad(session, video, currentTime) {
-        if (!session || !video) return;
-
-        if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
-            applyHlsRuntimeConfig(session.hls, session);
-        }
-
-        if (session.hls && typeof session.hls.startLoad === 'function') {
-            try {
-                session.hls.startLoad(currentTime);
-                session.lastStartLoadAt = Date.now();
-            } catch (e) {
-                warn('failed to startLoad after decode recovery', e);
-            }
-        } else if (!session.nativeRecoveryJustReloaded) {
-            try {
-                video.load();
-            } catch (e2) {
-                // Для обычного mp4 это безопасный способ инициировать новый буфер.
-            }
-        }
-    }
-
-    function completeDecodeRecovery(session, currentTime, wasPaused, reason) {
-        var video;
-
-        if (!session || session.destroyed) return;
-
-        video = session.video || getCurrentVideo();
-        if (!video) {
-            session.recoveryInProgress = false;
-            return;
-        }
-
-        session.video = video;
-        session.hls = getCurrentHls(video) || session.hls;
-
-        restoreCurrentTime(video, currentTime);
-
-        if (!wasPaused) {
-            safePlay(video);
-        }
-
-        session.nativeRecoveryJustReloaded = false;
-        session.recoveryInProgress = false;
-
-        log('decode recovery finished, reason =', reason);
-        evaluateSession('decode-recovery-finished');
-    }
-
-    // Аккуратно завершаем recover и возвращаем позицию/воспроизведение.
-    function finishDecodeRecovery(session, currentTime, wasPaused, reason, allowWait) {
-        var video;
-        var shouldWaitForSeekReady;
-
-        if (!session || session.destroyed) return;
-
-        video = session.video || getCurrentVideo();
-        if (!video) {
-            session.recoveryInProgress = false;
-            return;
-        }
-
-        session.video = video;
-        session.hls = getCurrentHls(video) || session.hls;
-        session.lastStartLoadAt = 0;
-
-        shouldWaitForSeekReady = allowWait !== false && !canRestoreTimeNow(video, currentTime);
-
-        if (shouldWaitForSeekReady) {
-            waitForRecoverSeekReady(session, video, currentTime, wasPaused, reason);
-        }
-
-        startDecodeRecoveryLoad(session, video, currentTime);
-
-        if (shouldWaitForSeekReady) {
-            return;
-        }
-
-        completeDecodeRecovery(session, currentTime, wasPaused, reason);
-    }
-
-    // Для HLS самый безопасный способ полностью обнулить MSE-буфер — detach/attach через recoverMediaError().
-    function recoverHlsPlayback(session, reason, currentTime, wasPaused) {
-        var hls = session && session.hls;
-        var HlsCtor = window.Hls;
-        var finished = false;
-        var attachedHandler = null;
-
-        if (!session || !hls || typeof hls.recoverMediaError !== 'function') {
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':fallback');
-            return;
-        }
-
-        function finalize(tag) {
-            if (finished) return;
-            finished = true;
-
-            if (session && session.recoveryTimeoutTimer) {
-                clearTimeout(session.recoveryTimeoutTimer);
-                session.recoveryTimeoutTimer = null;
-            }
-
-            try {
-                if (attachedHandler && HlsCtor && HlsCtor.Events && typeof hls.off === 'function') {
-                    hls.off(HlsCtor.Events.MEDIA_ATTACHED, attachedHandler);
-                }
-            } catch (e) {
-                // На cleanup ошибки не критичны.
-            }
-
-            session.recoveryFinalizeTimer = setTimeout(function () {
-                session.recoveryFinalizeTimer = null;
-                finishDecodeRecovery(session, currentTime, wasPaused, reason + ':' + tag);
-            }, 100);
-        }
-
-        try {
-            if (typeof hls.stopLoad === 'function') {
-                hls.stopLoad();
-            }
-        } catch (e1) {
-            warn('failed to stopLoad before decode recovery', e1);
-        }
-
-        if (HlsCtor && HlsCtor.Events && typeof hls.on === 'function') {
-            attachedHandler = function () {
-                finalize('media-attached');
-            };
-
-            try {
-                hls.on(HlsCtor.Events.MEDIA_ATTACHED, attachedHandler);
-            } catch (e3) {
-                warn('failed to subscribe MEDIA_ATTACHED after recoverMediaError', e3);
-            }
-        }
-
-        try {
-            session.recoveryInProgress = true;
-            hls.recoverMediaError();
-        } catch (e2) {
-            warn('hls.recoverMediaError failed', e2);
-            finalize('recover-error');
-            return;
-        }
-
-        if (!finished) {
-            session.recoveryTimeoutTimer = setTimeout(function () {
-                session.recoveryTimeoutTimer = null;
-                finalize('timeout');
-            }, RECOVERY_ATTACH_TIMEOUT_MS);
-        }
-    }
-
-    function recoverHlsDetachAttach(session, reason, currentTime, wasPaused, reloadSource) {
-        var hls = session && session.hls;
-        var video = session && session.video;
-        var HlsCtor = window.Hls;
-        var attachedHandler = null;
-        var finished = false;
-        var sourceUrl = getPlayDataUrl(session && session.playData);
-
-        if (!session || !hls || !video) {
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':fallback');
-            return;
-        }
-
-        function finalize(tag) {
-            if (finished) return;
-            finished = true;
-
-            if (session.recoveryTimeoutTimer) {
-                clearTimeout(session.recoveryTimeoutTimer);
-                session.recoveryTimeoutTimer = null;
-            }
-
-            try {
-                if (attachedHandler && HlsCtor && HlsCtor.Events && typeof hls.off === 'function') {
-                    hls.off(HlsCtor.Events.MEDIA_ATTACHED, attachedHandler);
-                }
-            } catch (e) {
-                // На cleanup ошибки не критичны.
-            }
-
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':' + tag);
-        }
-
-        session.recoveryInProgress = true;
-
-        try {
-            if (typeof hls.stopLoad === 'function') hls.stopLoad();
-        } catch (e1) {
-            warn('failed to stopLoad before detach recovery', e1);
-        }
-
-        if (HlsCtor && HlsCtor.Events && typeof hls.on === 'function') {
-            attachedHandler = function () {
-                finalize(reloadSource ? 'source-reloaded' : 'media-reattached');
-            };
-
-            try {
-                hls.on(HlsCtor.Events.MEDIA_ATTACHED, attachedHandler);
-            } catch (e2) {
-                warn('failed to subscribe MEDIA_ATTACHED for detach recovery', e2);
-            }
-        }
-
-        try {
-            if (typeof hls.detachMedia === 'function') hls.detachMedia();
-
-            if (reloadSource && sourceUrl && typeof hls.loadSource === 'function') {
-                hls.loadSource(sourceUrl);
-            }
-
-            if (typeof hls.attachMedia === 'function') {
-                hls.attachMedia(video);
-            } else {
-                finalize('attach-unavailable');
-            }
-        } catch (e3) {
-            warn('hls detach/attach recovery failed', e3);
-            finalize('detach-attach-error');
-            return;
-        }
-
-        if (!finished) {
-            session.recoveryTimeoutTimer = setTimeout(function () {
-                session.recoveryTimeoutTimer = null;
-                finalize('timeout');
-            }, RECOVERY_ATTACH_TIMEOUT_MS);
-        }
-    }
-
-    function recoverNativeSoftPlayback(session, reason, currentTime, wasPaused) {
-        if (!session || !session.video) return;
-
-        session.recoveryInProgress = true;
-
-        try {
-            session.video.load();
-        } catch (e) {
-            // Если soft reload не сработал, finishDecodeRecovery сделает обычный fallback.
-        }
-
-        session.recoveryFinalizeTimer = setTimeout(function () {
-            session.recoveryFinalizeTimer = null;
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':native-soft');
-        }, 100);
-    }
-
-    function recreatePlaybackSession(session, reason, currentTime, wasPaused) {
-        var playData;
-        var video;
-        var newSession;
-
-        if (!session) return;
-
-        playData = session.playData;
-        video = session.video || getCurrentVideo();
-
-        clearSessionAsyncState(session);
-        unbindHlsEvents(session);
-        unbindSessionVideoEvents(session);
-
-        session.destroyed = true;
-        state.currentSession = null;
-
-        newSession = ensureSession(playData);
-        newSession.video = video;
-        newSession.hls = getCurrentHls(video);
-        newSession.recoveryAttempts = RECOVERY_MAX_ATTEMPTS;
-        newSession.recoveryStage = RECOVERY_MAX_ATTEMPTS;
-        newSession.lastRecoveryReason = String(reason || 'recreate-session');
-
-        if (video && typeof video.addEventListener === 'function' && !newSession.bound) {
-            bindSessionEvents(newSession);
-        }
-
-        if (newSession.hls && typeof newSession.hls.loadSource === 'function' && getPlayDataUrl(playData)) {
-            recoverHlsDetachAttach(newSession, reason + ':recreate-session', currentTime, wasPaused, true);
-            return;
-        }
-
-        recoverNativePlayback(newSession, reason + ':recreate-session', currentTime, wasPaused);
-    }
-
-    // Для обычного video без hls.js жёстко пересоздаём источник, чтобы буфер ушёл в ноль.
-    function recoverNativePlayback(session, reason, currentTime, wasPaused) {
-        var video;
-        var sourceAttr;
-        var sources;
-        var completed = false;
-        var loadedHandler;
-        var canPlayHandler;
-        var timeoutId = null;
-
-        if (!session || !session.video) return;
-
-        video = session.video;
-        sources = captureVideoSources(video);
-        sourceAttr = video.getAttribute('src') || '';
-
-        if (!sourceAttr && !sources.length) {
-            sourceAttr = video.currentSrc || video.src || '';
-        }
-
-        function cleanup() {
-            if (loadedHandler) video.removeEventListener('loadedmetadata', loadedHandler);
-            if (canPlayHandler) video.removeEventListener('canplay', canPlayHandler);
-            if (timeoutId) {
-                clearTimeout(timeoutId);
-                timeoutId = null;
-            }
-            session.recoveryReloadTimer = null;
-            session.recoveryNativeTimeoutTimer = null;
-
-            try {
-                if (session.handlers && session.handlers.error) {
-                    video.removeEventListener('error', session.handlers.error);
-                    video.addEventListener('error', session.handlers.error);
-                }
-            } catch (e) {
-                // На cleanup это не критично.
-            }
-        }
-
-        function finalize(tag) {
-            if (completed) return;
-            completed = true;
-            cleanup();
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':' + tag);
-        }
-
-        loadedHandler = function () {
-            finalize('loadedmetadata');
-        };
-
-        canPlayHandler = function () {
-            finalize('canplay');
-        };
-
-        session.recoveryInProgress = true;
-        session.nativeRecoveryJustReloaded = false;
-
-        try {
-            video.pause();
-        } catch (e1) {
-            // Не критично.
-        }
-
-        try {
-            video.removeEventListener('error', session.handlers && session.handlers.error);
-        } catch (e2) {
-            // Временный шум от video.load() не должен создавать рекурсию.
-        }
-
-        try {
-            video.removeAttribute('src');
-            clearVideoSources(video);
-            video.load();
-        } catch (e3) {
-            warn('failed to clear native video source', e3);
-        }
-
-        session.recoveryReloadTimer = setTimeout(function () {
-            session.recoveryReloadTimer = null;
-            try {
-                if (sourceAttr) {
-                    video.setAttribute('src', sourceAttr);
-                    video.src = sourceAttr;
-                }
-
-                restoreVideoSources(video, sources);
-
-                video.addEventListener('loadedmetadata', loadedHandler);
-                video.addEventListener('canplay', canPlayHandler);
-                video.load();
-                session.nativeRecoveryJustReloaded = true;
-            } catch (e4) {
-                warn('failed to restore native video source', e4);
-                finalize('restore-error');
-                return;
-            }
-
-            timeoutId = setTimeout(function () {
-                finalize('timeout');
-            }, RECOVERY_ATTACH_TIMEOUT_MS);
-            session.recoveryNativeTimeoutTimer = timeoutId;
-        }, RECOVERY_NATIVE_RELOAD_DELAY_MS);
-    }
-
-    // Центральная точка восстановления после decode/media ошибок.
-    function requestDecodeRecovery(session, reason) {
-        var video;
-        var currentTime;
-        var wasPaused;
-        var now = Date.now();
-
-        if (!isRecoveryEnabled()) return;
-
-        session = session || ensureSession();
-        if (!session || session.destroyed) return;
-
-        video = session.video || getCurrentVideo();
-        if (!video) return;
-
-        session.video = video;
-        session.hls = getCurrentHls(video) || session.hls;
-
-        if (session.recoveryInProgress) return;
-        if (session.recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) return;
-
-        clearSessionAsyncState(session);
-
-        currentTime = toNumber(video.currentTime, 0);
-        wasPaused = !!video.paused;
-
-        session.lastRecoveryAt = now;
-        session.lastRecoveryReason = String(reason || 'unknown');
-        session.recoveryAttempts += 1;
-        session.recoveryStage = Math.min(RECOVERY_MAX_ATTEMPTS, session.recoveryAttempts);
-        session.lastStablePlaybackAt = 0;
-
-        log('decode recovery started, reason =', session.lastRecoveryReason, 'attempt =', session.recoveryAttempts, 'stage =', session.recoveryStage, 'time =', currentTime);
-
-        if (session.hls && typeof session.hls.recoverMediaError === 'function') {
-            if (session.recoveryStage <= 1) {
-                recoverHlsPlayback(session, session.lastRecoveryReason + ':soft', currentTime, wasPaused);
-            } else if (session.recoveryStage === 2) {
-                recoverHlsDetachAttach(session, session.lastRecoveryReason + ':detach-attach', currentTime, wasPaused, false);
-            } else if (session.recoveryStage === 3) {
-                recoverHlsDetachAttach(session, session.lastRecoveryReason + ':full-source-reload', currentTime, wasPaused, true);
-            } else {
-                recreatePlaybackSession(session, session.lastRecoveryReason + ':recreate', currentTime, wasPaused);
-            }
-            return;
-        }
-
-        if (session.recoveryStage <= 1) {
-            recoverNativeSoftPlayback(session, session.lastRecoveryReason, currentTime, wasPaused);
-        } else if (session.recoveryStage < RECOVERY_MAX_ATTEMPTS) {
-            recoverNativePlayback(session, session.lastRecoveryReason, currentTime, wasPaused);
-        } else {
-            recreatePlaybackSession(session, session.lastRecoveryReason + ':recreate', currentTime, wasPaused);
-        }
-    }
-
-    function getHlsNetworkRetryDelay(session, reason) {
-        var count;
-        var info;
-
-        if (!session) return HLS_NETWORK_RETRY_BASE_MS;
-
-        if (reason && session.lastHlsNetworkErrorReason && session.lastHlsNetworkErrorReason !== reason) {
-            session.hlsNetworkRetryCount = 0;
-        }
-
-        count = Math.max(0, session.hlsNetworkRetryCount || 0);
-
-        try {
-            info = getForwardBufferInfo(session.video || getCurrentVideo(), session.hls);
-
-            if (info && info.ahead <= HLS_NETWORK_LOW_BUFFER_RETRY_SEC) {
-                return 0;
-            }
-        } catch (e) {
-            // Без данных о буфере используем обычный backoff.
-        }
-
-        if (count <= 0) return 0;
-
-        return Math.min(HLS_NETWORK_RETRY_MAX_MS, HLS_NETWORK_RETRY_BASE_MS * Math.pow(2, count - 1));
-    }
-
-    function handleHlsNetworkErrorTarget(session, reason) {
-        var now = Date.now();
-        var retryCount;
-
-        if (!session || !session.hls || !shouldUseBufferingForPlayData(session.playData)) return;
-
-        retryCount = Math.max(0, session.hlsNetworkRetryCount || 0);
-
-        session.predictorHoldProbeUntil = Math.max(session.predictorHoldProbeUntil || 0, now + STALL_PREDICTOR_HOLD_MS);
-        session.lastProbeAt = now;
-
-        if (retryCount >= 1) {
-            session.hlsKeeperStallCount = Math.max(session.hlsKeeperStallCount || 0, HLS_KEEPER_LEVEL_DOWN_STALLS);
-            maybeLowerHlsLevelForKeeper(session, reason || 'hls-network');
-        }
-
-        applyHlsRuntimeConfig(session.hls, session);
-
-        log('hls target kept after network error, reason =', reason || 'unknown', 'target =', getEffectiveHlsTargetSec(session));
-    }
-
-    function clearHlsNetworkRetryTimer(session) {
-        if (!session || !session.hlsNetworkRetryTimer) return;
-
-        clearTimeout(session.hlsNetworkRetryTimer);
-        session.hlsNetworkRetryTimer = null;
-    }
-
     function maybeExpandHlsCeiling(session, info, reason) {
         var now = Date.now();
         var effectiveTarget;
@@ -1983,83 +1116,6 @@ var PLUGIN_VERSION = '1.2.0';
         return true;
     }
 
-    function markHlsNetworkProgress(session) {
-        if (!session) return;
-
-        session.lastHlsNetworkProgressAt = Date.now();
-        session.lastHlsNetworkErrorReason = '';
-        clearHlsNetworkRetryTimer(session);
-        session.hlsNetworkRetryCount = 0;
-        maybeRestoreHlsLevelAfterProgress(session, 'buffered-fragments');
-    }
-
-    function restartHlsNetworkLoad(session, reason) {
-        var hls = session && session.hls;
-        var video = session && (session.video || getCurrentVideo());
-        var currentTime = video ? toNumber(video.currentTime, -1) : -1;
-
-        if (!session || !hls || typeof hls.startLoad !== 'function') {
-            return;
-        }
-
-        session.lastStartLoadAt = 0;
-
-        try {
-            if (video) session.video = video;
-
-            syncHlsPlaylistTypeFromState(session, reason + ':network-retry-state');
-
-            if (shouldUseBufferingForPlayData(session.playData)) {
-                applyHlsRuntimeConfig(hls, session);
-            }
-
-            hls.startLoad();
-            session.lastStartLoadAt = Date.now();
-            session.lastHlsNetworkRetryAt = session.lastStartLoadAt;
-            session.hlsNetworkRetryCount = Math.min(8, (session.hlsNetworkRetryCount || 0) + 1);
-            session.lastHlsNetworkErrorReason = String(reason || 'hls-network');
-            log('hls network load continued, reason =', reason || 'unknown', 'retry =', session.hlsNetworkRetryCount, 'current =', currentTime);
-        } catch (e1) {
-            warn('hls network retry startLoad failed', e1);
-            return;
-        }
-    }
-
-    function requestHlsNetworkRecovery(session, reason) {
-        var now = Date.now();
-        var delay;
-        var elapsed;
-        var waitMs;
-
-        if (!isRecoveryEnabled()) return;
-
-        session = session || ensureSession();
-        if (!session || session.destroyed) return;
-
-        session.hls = getCurrentHls(session.video || getCurrentVideo()) || session.hls;
-
-        if (!session.hls) return;
-        handleHlsNetworkErrorTarget(session, reason || 'hls-network');
-
-        if (session.hlsNetworkRetryTimer) return;
-
-        delay = getHlsNetworkRetryDelay(session, reason);
-        elapsed = session.lastHlsNetworkRetryAt ? now - session.lastHlsNetworkRetryAt : delay;
-        waitMs = Math.max(0, delay - elapsed);
-
-        if (waitMs <= 0) {
-            restartHlsNetworkLoad(session, reason || 'hls-network');
-            return;
-        }
-
-        session.hlsNetworkRetryTimer = setTimeout(function () {
-            session.hlsNetworkRetryTimer = null;
-            restartHlsNetworkLoad(session, reason || 'hls-network');
-        }, waitMs);
-
-        log('hls network retry scheduled, reason =', reason || 'unknown', 'delay =', waitMs);
-    }
-
     // Для обычного video браузер сам решает, сколько качать вперёд.
     // Здесь мы аккуратно "подталкиваем" его к дальнейшей загрузке кратким seek вперёд-назад.
     function forceNativeBuffer(session, reason) {
@@ -2076,7 +1132,6 @@ var PLUGIN_VERSION = '1.2.0';
         if (!session || !session.video) return;
         if (!shouldUseBufferingForPlayData(session.playData)) return;
         if (session.hls) return;
-        if (session.recoveryInProgress) return;
         if (session.nativeKickInProgress) return;
         if (now - session.lastNativeKickAt < NATIVE_KICK_COOLDOWN_MS) return;
 
@@ -2246,7 +1301,7 @@ var PLUGIN_VERSION = '1.2.0';
     }
 
     function canUsePrebuffer(session) {
-        if (!session || session.destroyed || !session.video || session.recoveryInProgress) return false;
+        if (!session || session.destroyed || !session.video) return false;
         if (!isPrebufferEnabled()) return false;
         if (!shouldUseBufferingForPlayData(session.playData)) return false;
         if (session.prebufferDone) return false;
@@ -2678,7 +1733,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         if (!session || session.destroyed || !session.video || !info) return;
         if (!shouldUseBufferingForPlayData(session.playData)) return;
-        if (session.prebufferInProgress || session.recoveryInProgress) return;
+        if (session.prebufferInProgress) return;
 
         now = Date.now();
         current = toNumber(session.video.currentTime, 0);
@@ -2864,7 +1919,7 @@ var PLUGIN_VERSION = '1.2.0';
             },
             fragBuffered: function () {
                 syncHlsPlaylistTypeFromState(session, 'hls-frag-buffered');
-                markHlsNetworkProgress(session);
+                maybeRestoreHlsLevelAfterProgress(session, 'buffered-fragments');
                 evaluateSession('hls-frag-buffered');
             },
             error: function (event, data) {
@@ -2872,18 +1927,11 @@ var PLUGIN_VERSION = '1.2.0';
 
                 syncHlsPlaylistTypeFromState(session, 'hls-error');
 
-                if (isRecoverableHlsNetworkError(data, HlsCtor)) {
+                if (!shouldUseBufferingForPlayData(session.playData)) return;
+                if (data.fatal) {
                     markStallSignal(session, data.details);
-                    requestHlsNetworkRecovery(session, 'hls:' + data.details);
                     return;
                 }
-
-                if (isRecoveryEnabled() && isRecoverableHlsError(data, HlsCtor)) {
-                    requestDecodeRecovery(session, 'hls:' + data.details);
-                }
-
-                if (!shouldUseBufferingForPlayData(session.playData)) return;
-                if (data.fatal) return;
 
                 if (data.details === HlsCtor.ErrorDetails.BUFFER_FULL_ERROR || data.details === HlsCtor.ErrorDetails.BUFFER_APPENDING_ERROR) {
                     learnDeviceLimit(session, data.details);
@@ -2929,9 +1977,6 @@ var PLUGIN_VERSION = '1.2.0';
 
         session.video = video;
         session.hls = getCurrentHls(video);
-        resetRecoveryAttemptsIfStable(session);
-
-        if (session.recoveryInProgress) return;
 
         if (session.bound && session.boundVideo && session.boundVideo !== video) {
             unbindSessionVideoEvents(session);
@@ -3048,7 +2093,6 @@ var PLUGIN_VERSION = '1.2.0';
             },
             timeupdate: function () {
                 markStablePlayback(session);
-                resetRecoveryAttemptsIfStable(session);
                 evaluateSession('timeupdate');
             },
             loadeddata: function () {
@@ -3074,13 +2118,6 @@ var PLUGIN_VERSION = '1.2.0';
                 evaluateSession('stalled');
             },
             error: function () {
-                var error = session.video ? session.video.error : null;
-
-                if (isRecoveryEnabled() && isNativeDecodeError(error)) {
-                    requestDecodeRecovery(session, 'video-error-code-' + String(error && error.code));
-                    return;
-                }
-
                 evaluateSession('error');
             },
             pause: function () {
@@ -3107,9 +2144,7 @@ var PLUGIN_VERSION = '1.2.0';
                     return;
                 }
 
-                session.recoveryInProgress = false;
                 markStablePlayback(session);
-                resetRecoveryAttemptsIfStable(session);
                 evaluateSession('playing');
             }
         };
@@ -3151,7 +2186,7 @@ var PLUGIN_VERSION = '1.2.0';
         if (token !== state.startToken) return;
         if (!playerIsOpened) return;
         if (!isAnyFeatureEnabled()) return;
-        if (isLiveLike && !isRecoveryEnabled()) return;
+        if (isLiveLike) return;
 
         if (!state.currentSession || state.currentSession.playData !== playData) {
             destroyCurrentSession();
@@ -3254,7 +2289,7 @@ var PLUGIN_VERSION = '1.2.0';
 
             if (!isAnyFeatureEnabled()) return;
 
-            if (!isLiveLikePlayData(data) || isRecoveryEnabled()) {
+            if (!isLiveLikePlayData(data)) {
                 ensureSession(data);
             }
 
