@@ -96,6 +96,8 @@ var PLUGIN_VERSION = '1.2.0';
     var RECOVERY_NATIVE_RELOAD_DELAY_MS = 120;
     var RECOVERY_MAX_ATTEMPTS = 4;
     var RECOVERY_STABLE_RESET_MS = 15000;
+    var HLS_NETWORK_RETRY_BASE_MS = 1500;
+    var HLS_NETWORK_RETRY_MAX_MS = 15000;
     var HLS_BUFFER_CONFIG_FIELDS = [
         'maxBufferLength',
         'maxMaxBufferLength',
@@ -997,7 +999,11 @@ var PLUGIN_VERSION = '1.2.0';
                 recoveryTimeoutTimer: null,
                 recoveryReloadTimer: null,
                 recoveryNativeTimeoutTimer: null,
-                recoverySeekReadyCleanup: null
+                recoverySeekReadyCleanup: null,
+                hlsNetworkRetryTimer: null,
+                hlsNetworkRetryCount: 0,
+                lastHlsNetworkRetryAt: 0,
+                lastHlsNetworkErrorReason: ''
             };
         }
 
@@ -1114,6 +1120,11 @@ var PLUGIN_VERSION = '1.2.0';
             session.recoveryNativeTimeoutTimer = null;
         }
 
+        if (session.hlsNetworkRetryTimer) {
+            clearTimeout(session.hlsNetworkRetryTimer);
+            session.hlsNetworkRetryTimer = null;
+        }
+
         if (session.prebufferPauseGuardTimer) {
             clearTimeout(session.prebufferPauseGuardTimer);
             session.prebufferPauseGuardTimer = null;
@@ -1146,6 +1157,9 @@ var PLUGIN_VERSION = '1.2.0';
         session.recoveryStage = 0;
         session.lastRecoveryAt = 0;
         session.lastRecoveryReason = '';
+        session.hlsNetworkRetryCount = 0;
+        session.lastHlsNetworkRetryAt = 0;
+        session.lastHlsNetworkErrorReason = '';
     }
 
     function markStablePlayback(session) {
@@ -1156,8 +1170,18 @@ var PLUGIN_VERSION = '1.2.0';
         video = session.video;
         if (video && (video.paused || video.seeking || video.ended)) return;
 
-        if (!session.lastStablePlaybackAt || (session.lastRecoveryAt && session.lastStablePlaybackAt < session.lastRecoveryAt)) {
+        if (!session.lastStablePlaybackAt ||
+            (session.lastRecoveryAt && session.lastStablePlaybackAt < session.lastRecoveryAt) ||
+            (session.lastHlsNetworkRetryAt && session.lastStablePlaybackAt < session.lastHlsNetworkRetryAt)) {
             session.lastStablePlaybackAt = Date.now();
+        }
+
+        if (session.lastHlsNetworkRetryAt &&
+            session.lastStablePlaybackAt >= session.lastHlsNetworkRetryAt &&
+            Date.now() - session.lastStablePlaybackAt >= RECOVERY_STABLE_RESET_MS) {
+            session.hlsNetworkRetryCount = 0;
+            session.lastHlsNetworkRetryAt = 0;
+            session.lastHlsNetworkErrorReason = '';
         }
     }
 
@@ -1818,27 +1842,34 @@ var PLUGIN_VERSION = '1.2.0';
         }
     }
 
-    function recoverHlsNetworkPlayback(session, reason, currentTime, wasPaused, stopFirst) {
+    function getHlsNetworkRetryDelay(session, reason) {
+        var count;
+
+        if (!session) return HLS_NETWORK_RETRY_BASE_MS;
+
+        if (reason && session.lastHlsNetworkErrorReason && session.lastHlsNetworkErrorReason !== reason) {
+            session.hlsNetworkRetryCount = 0;
+        }
+
+        count = Math.max(0, session.hlsNetworkRetryCount || 0);
+        return Math.min(HLS_NETWORK_RETRY_MAX_MS, HLS_NETWORK_RETRY_BASE_MS * Math.pow(2, count));
+    }
+
+    function restartHlsNetworkLoad(session, reason) {
         var hls = session && session.hls;
+        var video = session && (session.video || getCurrentVideo());
+        var currentTime = video ? toNumber(video.currentTime, -1) : -1;
 
         if (!session || !hls || typeof hls.startLoad !== 'function') {
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':fallback', false);
             return;
         }
 
-        session.recoveryInProgress = true;
         session.lastStartLoadAt = 0;
 
-        if (stopFirst && typeof hls.stopLoad === 'function') {
-            try {
-                hls.stopLoad();
-            } catch (e1) {
-                warn('failed to stopLoad before network recovery', e1);
-            }
-        }
-
         try {
-            syncHlsPlaylistTypeFromState(session, reason + ':network-state');
+            if (video) session.video = video;
+
+            syncHlsPlaylistTypeFromState(session, reason + ':network-retry-state');
 
             if (shouldUseBufferingForPlayData(session.playData)) {
                 applyHlsRuntimeConfig(hls, session);
@@ -1846,61 +1877,47 @@ var PLUGIN_VERSION = '1.2.0';
 
             hls.startLoad(currentTime);
             session.lastStartLoadAt = Date.now();
-        } catch (e2) {
-            warn('hls network recovery startLoad failed', e2);
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':start-error', false);
+            session.lastHlsNetworkRetryAt = session.lastStartLoadAt;
+            session.hlsNetworkRetryCount = Math.min(8, (session.hlsNetworkRetryCount || 0) + 1);
+            session.lastHlsNetworkErrorReason = String(reason || 'hls-network');
+            log('hls network load restarted, reason =', reason || 'unknown', 'retry =', session.hlsNetworkRetryCount, 'time =', currentTime);
+        } catch (e1) {
+            warn('hls network retry startLoad failed', e1);
             return;
         }
-
-        session.recoveryFinalizeTimer = setTimeout(function () {
-            session.recoveryFinalizeTimer = null;
-            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':network-restart', false);
-        }, 250);
     }
 
     function requestHlsNetworkRecovery(session, reason) {
-        var video;
-        var currentTime;
-        var wasPaused;
         var now = Date.now();
+        var delay;
+        var elapsed;
+        var waitMs;
 
         if (!isRecoveryEnabled()) return;
 
         session = session || ensureSession();
         if (!session || session.destroyed) return;
 
-        video = session.video || getCurrentVideo();
-        if (!video) return;
-
-        session.video = video;
-        session.hls = getCurrentHls(video) || session.hls;
+        session.hls = getCurrentHls(session.video || getCurrentVideo()) || session.hls;
 
         if (!session.hls) return;
-        if (session.recoveryInProgress) return;
-        if (session.recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) return;
+        if (session.hlsNetworkRetryTimer) return;
 
-        clearSessionAsyncState(session);
+        delay = getHlsNetworkRetryDelay(session, reason);
+        elapsed = session.lastHlsNetworkRetryAt ? now - session.lastHlsNetworkRetryAt : delay;
+        waitMs = Math.max(0, delay - elapsed);
 
-        currentTime = toNumber(video.currentTime, 0);
-        wasPaused = !!video.paused;
-
-        session.lastRecoveryAt = now;
-        session.lastRecoveryReason = String(reason || 'hls-network');
-        session.recoveryAttempts += 1;
-        session.recoveryStage = Math.min(RECOVERY_MAX_ATTEMPTS, session.recoveryAttempts);
-        session.lastStablePlaybackAt = 0;
-
-        log('hls network recovery started, reason =', session.lastRecoveryReason, 'attempt =', session.recoveryAttempts, 'stage =', session.recoveryStage, 'time =', currentTime);
-
-        if (session.recoveryStage <= 1) {
-            recoverHlsNetworkPlayback(session, session.lastRecoveryReason + ':soft', currentTime, wasPaused, false);
-        } else if (session.recoveryStage === 2) {
-            recoverHlsNetworkPlayback(session, session.lastRecoveryReason + ':restart-load', currentTime, wasPaused, true);
-        } else if (session.recoveryStage === 3) {
-            recoverHlsDetachAttach(session, session.lastRecoveryReason + ':source-reload', currentTime, wasPaused, true);
-        } else {
-            recreatePlaybackSession(session, session.lastRecoveryReason + ':recreate', currentTime, wasPaused);
+        if (waitMs <= 0) {
+            restartHlsNetworkLoad(session, reason || 'hls-network');
+            return;
         }
+
+        session.hlsNetworkRetryTimer = setTimeout(function () {
+            session.hlsNetworkRetryTimer = null;
+            restartHlsNetworkLoad(session, reason || 'hls-network');
+        }, waitMs);
+
+        log('hls network retry scheduled, reason =', reason || 'unknown', 'delay =', waitMs);
     }
 
     // Для обычного video браузер сам решает, сколько качать вперёд.
