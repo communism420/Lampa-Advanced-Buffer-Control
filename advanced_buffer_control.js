@@ -36,6 +36,7 @@ var PLUGIN_VERSION = '1.2.0';
     var PREBUFFER_ENABLED_KEY = 'advanced_buffer_control_prebuffer_enabled';
     var RECOVERY_ENABLED_KEY = 'advanced_buffer_control_decode_recovery_enabled';
     var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
+    var LEARNED_LIMIT_MIGRATION_KEY = 'advanced_buffer_control_learned_limit_migration_v120';
     var MENU_TEXT = {
         enabled_name: {
             ru: 'Умное заполнение буфера',
@@ -72,6 +73,7 @@ var PLUGIN_VERSION = '1.2.0';
     var DISCOVERY_START_SEC = 480;
     var ABSOLUTE_MAX_SEC = 900;
     var SAFE_MARGIN_AFTER_ERROR_SEC = 15;
+    var SUSPICIOUS_LEARNED_LIMIT_SEC = 60;
     var PROBE_STEP_SEC = 30;
     var PROBE_MARGIN_SEC = 20;
     var LOW_BUFFER_THRESHOLD_SEC = 55;
@@ -381,6 +383,9 @@ var PLUGIN_VERSION = '1.2.0';
 
     // Инициализируем дефолтные значения Storage.
     function normalizeStorage() {
+        var storedMigration;
+        var storedLimit;
+
         try {
             if (Lampa.Storage.get(ENABLED_KEY, null) === null) {
                 Lampa.Storage.set(ENABLED_KEY, ENABLED_DEFAULT);
@@ -406,13 +411,29 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         try {
+            storedMigration = String(Lampa.Storage.get(LEARNED_LIMIT_MIGRATION_KEY, '') || '');
+            storedLimit = toNumber(Lampa.Storage.get(LEARNED_LIMIT_KEY, 0), 0);
+
+            if (storedMigration !== PLUGIN_VERSION) {
+                if (storedLimit > 0 && storedLimit < SUSPICIOUS_LEARNED_LIMIT_SEC) {
+                    Lampa.Storage.set(LEARNED_LIMIT_KEY, '0');
+                    log('old suspicious learned buffer limit reset =', storedLimit, 'sec');
+                }
+
+                Lampa.Storage.set(LEARNED_LIMIT_MIGRATION_KEY, PLUGIN_VERSION);
+            }
+        } catch (e2) {
+            warn('failed to migrate learned limit', e2);
+        }
+
+        try {
             var learned = getLearnedLimitSec();
 
             if (learned > 0) {
                 Lampa.Storage.set(LEARNED_LIMIT_KEY, String(learned));
             }
-        } catch (e2) {
-            warn('failed to normalize learned limit', e2);
+        } catch (e3) {
+            warn('failed to normalize learned limit', e3);
         }
     }
 
@@ -640,11 +661,12 @@ var PLUGIN_VERSION = '1.2.0';
         state.errorCleanerBound = true;
     }
 
-    // Патчим только attachMedia и destroy у Hls.
+    // Патчим только attachMedia/loadSource/destroy у Hls.
     // Конструктор Hls НЕ трогаем, чтобы избежать рекурсии.
     function ensureHlsPatched(playData) {
         var OriginalHls;
         var originalAttachMedia;
+        var originalLoadSource;
         var originalDestroy;
 
         if (state.hlsPatched) {
@@ -671,8 +693,15 @@ var PLUGIN_VERSION = '1.2.0';
                     window.__advancedBufferLastHls = this;
                     state.lastHls = this;
 
-                    if (state.currentSession && shouldUseBufferingForPlayData(state.currentSession.playData)) {
-                        applyHlsRuntimeConfig(this, state.currentSession);
+                    if (state.currentSession) {
+                        state.currentSession.video = media || state.currentSession.video;
+                        state.currentSession.hls = this;
+                        bindHlsEvents(state.currentSession);
+                        syncHlsPlaylistTypeFromState(state.currentSession, 'attach-media');
+
+                        if (shouldUseBufferingForPlayData(state.currentSession.playData)) {
+                            applyHlsRuntimeConfig(this, state.currentSession);
+                        }
                     }
                 } catch (e) {
                     warn('attachMedia patch failed', e);
@@ -682,6 +711,33 @@ var PLUGIN_VERSION = '1.2.0';
             };
 
             OriginalHls.prototype.__advancedBufferAttachPatched = true;
+        }
+
+        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferLoadSourcePatched && typeof OriginalHls.prototype.loadSource === 'function') {
+            originalLoadSource = OriginalHls.prototype.loadSource;
+
+            OriginalHls.prototype.loadSource = function () {
+                try {
+                    window.__advancedBufferLastHls = this;
+                    state.lastHls = this;
+
+                    if (state.currentSession) {
+                        state.currentSession.hls = this;
+                        bindHlsEvents(state.currentSession);
+                        syncHlsPlaylistTypeFromState(state.currentSession, 'load-source');
+
+                        if (shouldUseBufferingForPlayData(state.currentSession.playData)) {
+                            applyHlsRuntimeConfig(this, state.currentSession);
+                        }
+                    }
+                } catch (e) {
+                    warn('loadSource patch failed', e);
+                }
+
+                return originalLoadSource.apply(this, arguments);
+            };
+
+            OriginalHls.prototype.__advancedBufferLoadSourcePatched = true;
         }
 
         if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferDestroyPatched) {
@@ -1157,6 +1213,105 @@ var PLUGIN_VERSION = '1.2.0';
             (data.fatal && details === HlsCtor.ErrorDetails.BUFFER_APPENDING_ERROR) ||
             (data.fatal && details === HlsCtor.ErrorDetails.FRAG_PARSING_ERROR) ||
             (data.fatal && details === HlsCtor.ErrorDetails.INTERNAL_EXCEPTION);
+    }
+
+    function isRecoverableHlsNetworkError(data, HlsCtor) {
+        var details;
+        var ErrorDetails;
+
+        if (!data || !data.fatal || !HlsCtor || !HlsCtor.ErrorDetails) return false;
+
+        ErrorDetails = HlsCtor.ErrorDetails;
+        details = data.details;
+
+        if (HlsCtor.ErrorTypes && data.type === HlsCtor.ErrorTypes.NETWORK_ERROR) return true;
+
+        return details === ErrorDetails.FRAG_LOAD_ERROR ||
+            details === ErrorDetails.FRAG_LOAD_TIMEOUT ||
+            details === ErrorDetails.LEVEL_LOAD_ERROR ||
+            details === ErrorDetails.LEVEL_LOAD_TIMEOUT ||
+            details === ErrorDetails.MANIFEST_LOAD_ERROR ||
+            details === ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
+            details === ErrorDetails.KEY_LOAD_ERROR ||
+            details === ErrorDetails.KEY_LOAD_TIMEOUT;
+    }
+
+    function collectHlsDetailsCandidates(hls) {
+        var result = [];
+
+        function add(details) {
+            if (details && typeof details === 'object' && typeof details.live === 'boolean') {
+                result.push(details);
+            }
+        }
+
+        if (!hls) return result;
+
+        try {
+            add(hls.latestLevelDetails);
+            add(hls.levelDetails);
+            add(hls.details);
+
+            if (hls.streamController) {
+                add(hls.streamController.latestLevelDetails);
+                add(hls.streamController.levelDetails);
+                add(hls.streamController.details);
+            }
+
+            if (hls.levels && hls.levels.length) {
+                Array.prototype.forEach.call(hls.levels, function (level) {
+                    if (level) add(level.details);
+                });
+            }
+        } catch (e) {
+            warn('failed to inspect hls playlist details', e);
+        }
+
+        return result;
+    }
+
+    function syncHlsPlaylistTypeFromState(session, reason) {
+        var video;
+        var rawDuration;
+        var detailsList;
+        var i;
+
+        if (!session || !session.hls || !isHlsPlayData(session.playData)) return false;
+        if (session.playData && session.playData[LIVE_LIKE_FLAG]) return true;
+
+        video = session.video;
+
+        if (video) {
+            rawDuration = video.duration;
+
+            if (rawDuration && !isFinite(rawDuration)) {
+                markSessionLiveLike(session, reason || 'video-duration');
+                return true;
+            }
+
+            if (rawDuration && isFinite(rawDuration) && rawDuration > 0) {
+                markSessionVodLike(session, reason || 'video-duration');
+                return true;
+            }
+        }
+
+        detailsList = collectHlsDetailsCandidates(session.hls);
+
+        for (i = 0; i < detailsList.length; i++) {
+            if (detailsList[i].live === true) {
+                markSessionLiveLike(session, reason || 'hls-state');
+                return true;
+            }
+        }
+
+        for (i = 0; i < detailsList.length; i++) {
+            if (detailsList[i].live === false) {
+                markSessionVodLike(session, reason || 'hls-state');
+                return true;
+            }
+        }
+
+        return false;
     }
 
     function canRestoreTimeNow(video, time) {
@@ -1658,6 +1813,91 @@ var PLUGIN_VERSION = '1.2.0';
             recoverNativeSoftPlayback(session, session.lastRecoveryReason, currentTime, wasPaused);
         } else if (session.recoveryStage < RECOVERY_MAX_ATTEMPTS) {
             recoverNativePlayback(session, session.lastRecoveryReason, currentTime, wasPaused);
+        } else {
+            recreatePlaybackSession(session, session.lastRecoveryReason + ':recreate', currentTime, wasPaused);
+        }
+    }
+
+    function recoverHlsNetworkPlayback(session, reason, currentTime, wasPaused, stopFirst) {
+        var hls = session && session.hls;
+
+        if (!session || !hls || typeof hls.startLoad !== 'function') {
+            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':fallback', false);
+            return;
+        }
+
+        session.recoveryInProgress = true;
+        session.lastStartLoadAt = 0;
+
+        if (stopFirst && typeof hls.stopLoad === 'function') {
+            try {
+                hls.stopLoad();
+            } catch (e1) {
+                warn('failed to stopLoad before network recovery', e1);
+            }
+        }
+
+        try {
+            syncHlsPlaylistTypeFromState(session, reason + ':network-state');
+
+            if (shouldUseBufferingForPlayData(session.playData)) {
+                applyHlsRuntimeConfig(hls, session);
+            }
+
+            hls.startLoad(currentTime);
+            session.lastStartLoadAt = Date.now();
+        } catch (e2) {
+            warn('hls network recovery startLoad failed', e2);
+            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':start-error', false);
+            return;
+        }
+
+        session.recoveryFinalizeTimer = setTimeout(function () {
+            session.recoveryFinalizeTimer = null;
+            finishDecodeRecovery(session, currentTime, wasPaused, reason + ':network-restart', false);
+        }, 250);
+    }
+
+    function requestHlsNetworkRecovery(session, reason) {
+        var video;
+        var currentTime;
+        var wasPaused;
+        var now = Date.now();
+
+        if (!isRecoveryEnabled()) return;
+
+        session = session || ensureSession();
+        if (!session || session.destroyed) return;
+
+        video = session.video || getCurrentVideo();
+        if (!video) return;
+
+        session.video = video;
+        session.hls = getCurrentHls(video) || session.hls;
+
+        if (!session.hls) return;
+        if (session.recoveryInProgress) return;
+        if (session.recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) return;
+
+        clearSessionAsyncState(session);
+
+        currentTime = toNumber(video.currentTime, 0);
+        wasPaused = !!video.paused;
+
+        session.lastRecoveryAt = now;
+        session.lastRecoveryReason = String(reason || 'hls-network');
+        session.recoveryAttempts += 1;
+        session.recoveryStage = Math.min(RECOVERY_MAX_ATTEMPTS, session.recoveryAttempts);
+        session.lastStablePlaybackAt = 0;
+
+        log('hls network recovery started, reason =', session.lastRecoveryReason, 'attempt =', session.recoveryAttempts, 'stage =', session.recoveryStage, 'time =', currentTime);
+
+        if (session.recoveryStage <= 1) {
+            recoverHlsNetworkPlayback(session, session.lastRecoveryReason + ':soft', currentTime, wasPaused, false);
+        } else if (session.recoveryStage === 2) {
+            recoverHlsNetworkPlayback(session, session.lastRecoveryReason + ':restart-load', currentTime, wasPaused, true);
+        } else if (session.recoveryStage === 3) {
+            recoverHlsDetachAttach(session, session.lastRecoveryReason + ':source-reload', currentTime, wasPaused, true);
         } else {
             recreatePlaybackSession(session, session.lastRecoveryReason + ':recreate', currentTime, wasPaused);
         }
@@ -2271,6 +2511,8 @@ var PLUGIN_VERSION = '1.2.0';
         session.hlsBound = hls;
         session.hlsHandlers = {
             manifestParsed: function () {
+                syncHlsPlaylistTypeFromState(session, 'hls-manifest-parsed');
+
                 if (shouldUseBufferingForPlayData(session.playData)) {
                     applyHlsRuntimeConfig(hls, session);
                 }
@@ -2303,10 +2545,19 @@ var PLUGIN_VERSION = '1.2.0';
                 }
             },
             fragBuffered: function () {
+                syncHlsPlaylistTypeFromState(session, 'hls-frag-buffered');
                 evaluateSession('hls-frag-buffered');
             },
             error: function (event, data) {
                 if (!data || !data.details) return;
+
+                syncHlsPlaylistTypeFromState(session, 'hls-error');
+
+                if (isRecoverableHlsNetworkError(data, HlsCtor)) {
+                    markStallSignal(session, data.details);
+                    requestHlsNetworkRecovery(session, 'hls:' + data.details);
+                    return;
+                }
 
                 if (isRecoveryEnabled() && isRecoverableHlsError(data, HlsCtor)) {
                     requestDecodeRecovery(session, 'hls:' + data.details);
@@ -2332,6 +2583,7 @@ var PLUGIN_VERSION = '1.2.0';
             hls.on(HlsCtor.Events.LEVEL_SWITCHED, session.hlsHandlers.levelSwitched);
             hls.on(HlsCtor.Events.FRAG_BUFFERED, session.hlsHandlers.fragBuffered);
             hls.on(HlsCtor.Events.ERROR, session.hlsHandlers.error);
+            syncHlsPlaylistTypeFromState(session, 'hls-bind-state');
         } catch (e) {
             warn('failed to bind hls events', e);
         }
@@ -2368,6 +2620,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         if (session.hls) {
             bindHlsEvents(session);
+            syncHlsPlaylistTypeFromState(session, reason || 'evaluate-hls-state');
         }
 
         prepareVideoElement(video);
@@ -2616,6 +2869,8 @@ var PLUGIN_VERSION = '1.2.0';
         bindSessionEvents(session);
 
         if (session.hls) {
+            bindHlsEvents(session);
+            syncHlsPlaylistTypeFromState(session, 'player-ready-hls-state');
             applyHlsRuntimeConfig(session.hls, session);
 
             if (shouldUseBufferingForPlayData(session.playData)) {
@@ -2641,6 +2896,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         if (session.hls) {
             bindHlsEvents(session);
+            syncHlsPlaylistTypeFromState(session, reason || 'sync-hls-state');
 
             if (shouldUseBufferingForPlayData(session.playData)) {
                 applyHlsRuntimeConfig(session.hls, session);
@@ -2664,13 +2920,21 @@ var PLUGIN_VERSION = '1.2.0';
         // До создания Hls просим Lampa использовать именно hls.js для VOD m3u8,
         // иначе нативный HLS браузера/вебвью не даст контролировать буфер.
         Lampa.Player.listener.follow('start', function (data) {
+            var playUrl;
+
             state.startToken += 1;
             destroyCurrentSession();
             ensureHlsPatched(data);
 
             if (!isAnyFeatureEnabled()) return;
 
-            if (shouldForceHlsJsForPlayData(data) && data && data.url && isM3U8Url(data.url) && typeof window.Hls !== 'undefined' && window.Hls.isSupported && window.Hls.isSupported()) {
+            if (!isLiveLikePlayData(data) || isRecoveryEnabled()) {
+                ensureSession(data);
+            }
+
+            playUrl = getPlayDataUrl(data);
+
+            if (shouldForceHlsJsForPlayData(data) && playUrl && isM3U8Url(playUrl) && typeof window.Hls !== 'undefined' && window.Hls.isSupported && window.Hls.isSupported()) {
                 data.hls_type = 'hlsjs';
             }
         });
