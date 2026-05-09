@@ -81,9 +81,11 @@ var PLUGIN_VERSION = '1.2.0';
     var STARTLOAD_COOLDOWN = 7000;
     var HLS_KEEPER_COOLDOWN_MS = 1500;
     var HLS_KEEPER_TARGET_MARGIN_SEC = 5;
-    var HLS_KEEPER_STALLED_MS = 15000;
+    var HLS_KEEPER_STALLED_MS = 10000;
     var HLS_KEEPER_STOPSTART_COOLDOWN_MS = 12000;
     var HLS_KEEPER_LOG_INTERVAL_MS = 15000;
+    var HLS_KEEPER_LEVEL_DOWN_STALLS = 2;
+    var HLS_KEEPER_LEVEL_RESTORE_PROGRESS_COUNT = 4;
     var BACK_BUFFER_KEEP_SEC = 20;
     var BACK_BUFFER_LEARN_POSTPONE_MAX = 1;
     var NATIVE_LOW_BUFFER_THRESHOLD_SEC = 18;
@@ -111,6 +113,8 @@ var PLUGIN_VERSION = '1.2.0';
     var HLS_NETWORK_RAMP_SUCCESS_COUNT = 2;
     var HLS_NETWORK_RAMP_MIN_INTERVAL_MS = 5000;
     var HLS_NETWORK_RAMP_MARGIN_SEC = 8;
+    var HLS_CEILING_EXPAND_INTERVAL_MS = 5000;
+    var HLS_CEILING_EXPAND_MARGIN_SEC = 8;
     var HLS_BUFFER_CONFIG_FIELDS = [
         'maxBufferLength',
         'maxMaxBufferLength',
@@ -571,6 +575,15 @@ var PLUGIN_VERSION = '1.2.0';
         if (session && session.hlsNetworkTargetSec && session.hlsNetworkLimitUntil && now < session.hlsNetworkLimitUntil) {
             target = Math.min(target, session.hlsNetworkTargetSec);
         }
+
+        return roundToSafeStep(target);
+    }
+
+    function getPreferredHlsFillTargetSec(session) {
+        var target = getCurrentDesiredTargetSec(session);
+
+        if (target < DISCOVERY_START_SEC) target = DISCOVERY_START_SEC;
+        if (target > ABSOLUTE_MAX_SEC) target = ABSOLUTE_MAX_SEC;
 
         return roundToSafeStep(target);
     }
@@ -1037,7 +1050,12 @@ var PLUGIN_VERSION = '1.2.0';
                 lastHlsKeeperLogAt: 0,
                 lastHlsBufferEnd: 0,
                 lastHlsBufferGrowthAt: 0,
-                lastHlsSoftRestartAt: 0
+                lastHlsSoftRestartAt: 0,
+                lastHlsCeilingExpandAt: 0,
+                hlsKeeperStallCount: 0,
+                hlsLevelCapBeforeKeeper: null,
+                hlsLevelCapApplied: false,
+                hlsLevelProgressCount: 0
             };
         }
 
@@ -1204,6 +1222,11 @@ var PLUGIN_VERSION = '1.2.0';
         session.lastHlsBufferEnd = 0;
         session.lastHlsBufferGrowthAt = 0;
         session.lastHlsSoftRestartAt = 0;
+        session.lastHlsCeilingExpandAt = 0;
+        session.hlsKeeperStallCount = 0;
+        session.hlsLevelCapBeforeKeeper = null;
+        session.hlsLevelCapApplied = false;
+        session.hlsLevelProgressCount = 0;
     }
 
     function markStablePlayback(session) {
@@ -1955,7 +1978,7 @@ var PLUGIN_VERSION = '1.2.0';
         session.hlsNetworkRetryTimer = null;
     }
 
-    function rampHlsNetworkTarget(session, reason) {
+    function rampHlsNetworkTarget(session, reason, force, preferredTarget) {
         var now = Date.now();
         var currentCap;
         var nextCap;
@@ -1969,11 +1992,11 @@ var PLUGIN_VERSION = '1.2.0';
             return false;
         }
 
-        if (session.lastHlsNetworkRampAt && now - session.lastHlsNetworkRampAt < HLS_NETWORK_RAMP_MIN_INTERVAL_MS) {
+        if (!force && session.lastHlsNetworkRampAt && now - session.lastHlsNetworkRampAt < HLS_NETWORK_RAMP_MIN_INTERVAL_MS) {
             return false;
         }
 
-        target = session.targetSec || getInitialTargetSec();
+        target = preferredTarget || getPreferredHlsFillTargetSec(session);
         currentCap = session.hlsNetworkTargetSec;
         nextCap = roundToSafeStep(Math.min(target, currentCap + HLS_NETWORK_RAMP_STEP_SEC));
 
@@ -2004,6 +2027,7 @@ var PLUGIN_VERSION = '1.2.0';
         session.predictorHoldProbeUntil = Math.max(session.predictorHoldProbeUntil || 0, session.hlsNetworkLimitUntil);
 
         clearHlsNetworkRetryTimer(session);
+        maybeRestoreHlsLevelAfterProgress(session, 'frag-buffered');
 
         if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
             applyHlsRuntimeConfig(session.hls, session);
@@ -2021,6 +2045,41 @@ var PLUGIN_VERSION = '1.2.0';
         if (info.ahead < Math.max(0, session.hlsNetworkTargetSec - HLS_NETWORK_RAMP_MARGIN_SEC)) return false;
 
         return rampHlsNetworkTarget(session, reason || 'buffer-near-cap');
+    }
+
+    function maybeExpandHlsCeiling(session, info, reason) {
+        var now = Date.now();
+        var effectiveTarget;
+        var preferredTarget;
+        var nextTarget;
+
+        if (!session || !session.hls || !info || !isFinite(info.ahead)) return false;
+        if (!shouldUseBufferingForPlayData(session.playData)) return false;
+
+        effectiveTarget = getEffectiveHlsTargetSec(session);
+        preferredTarget = getPreferredHlsFillTargetSec(session);
+
+        if (effectiveTarget >= preferredTarget - HLS_CEILING_EXPAND_MARGIN_SEC) return false;
+        if (info.ahead < Math.max(0, effectiveTarget - HLS_CEILING_EXPAND_MARGIN_SEC)) return false;
+        if (now - session.lastHlsCeilingExpandAt < HLS_CEILING_EXPAND_INTERVAL_MS) return false;
+        if (session.lastBufferErrorAt && now - session.lastBufferErrorAt < 15000) return false;
+
+        session.lastHlsCeilingExpandAt = now;
+
+        if (session.hlsNetworkTargetSec && session.hlsNetworkLimitUntil && now < session.hlsNetworkLimitUntil) {
+            return rampHlsNetworkTarget(session, reason || 'ceiling-expand', true, preferredTarget);
+        }
+
+        nextTarget = roundToSafeStep(Math.min(preferredTarget, Math.max(session.targetSec || MIN_TARGET_SEC, effectiveTarget) + PROBE_STEP_SEC));
+
+        if (nextTarget <= effectiveTarget) return false;
+
+        session.targetSec = nextTarget;
+        session.lastProbeAt = now;
+        applyHlsRuntimeConfig(session.hls, session);
+
+        log('hls target expanded after reaching short ceiling, reason =', reason || 'unknown', 'target =', session.targetSec);
+        return true;
     }
 
     function markHlsNetworkProgress(session) {
@@ -2493,7 +2552,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         try {
             applyHlsRuntimeConfig(session.hls, session);
-            session.hls.startLoad(toNumber(session.video.currentTime, -1));
+            session.hls.startLoad();
             session.lastStartLoadAt = Date.now();
             log('forced HLS buffering, reason =', reason, 'target =', getEffectiveHlsTargetSec(session));
         } catch (e) {
@@ -2541,6 +2600,74 @@ var PLUGIN_VERSION = '1.2.0';
         if (!session.lastHlsBufferEnd || info.end > session.lastHlsBufferEnd + 0.25) {
             session.lastHlsBufferEnd = info.end;
             session.lastHlsBufferGrowthAt = now;
+            session.hlsKeeperStallCount = 0;
+            maybeRestoreHlsLevelAfterProgress(session, 'buffer-growth');
+        }
+    }
+
+    function maybeLowerHlsLevelForKeeper(session, reason) {
+        var hls;
+        var levelsLength;
+        var currentLevel;
+        var nextAutoLevel;
+        var loadLevel;
+        var baseLevel;
+        var newCap;
+
+        if (!session || !session.hls || session.hlsKeeperStallCount < HLS_KEEPER_LEVEL_DOWN_STALLS) return;
+
+        hls = session.hls;
+        levelsLength = hls.levels && hls.levels.length ? hls.levels.length : 0;
+        if (levelsLength <= 1) return;
+
+        currentLevel = toNumber(hls.currentLevel, -1);
+        nextAutoLevel = toNumber(hls.nextAutoLevel, -1);
+        loadLevel = toNumber(hls.loadLevel, -1);
+        baseLevel = currentLevel >= 0 ? currentLevel : (nextAutoLevel >= 0 ? nextAutoLevel : (loadLevel >= 0 ? loadLevel : levelsLength - 1));
+        newCap = Math.max(0, Math.min(levelsLength - 1, baseLevel - 1));
+
+        if (session.hlsLevelCapApplied && toNumber(hls.autoLevelCapping, -1) <= newCap) return;
+
+        if (!session.hlsLevelCapApplied) {
+            session.hlsLevelCapBeforeKeeper = toNumber(hls.autoLevelCapping, -1);
+        }
+
+        try {
+            hls.autoLevelCapping = newCap;
+            hls.nextAutoLevel = newCap;
+
+            if (toNumber(hls.currentLevel, -1) > newCap) {
+                hls.nextLevel = newCap;
+            }
+
+            session.hlsLevelCapApplied = true;
+            session.hlsLevelProgressCount = 0;
+            log('hls keeper lowered level cap, reason =', reason || 'keeper', 'cap =', newCap);
+        } catch (e) {
+            warn('failed to lower hls level cap', e);
+        }
+    }
+
+    function maybeRestoreHlsLevelAfterProgress(session, reason) {
+        var hls;
+        var previousCap;
+
+        if (!session || !session.hls || !session.hlsLevelCapApplied) return;
+
+        session.hlsLevelProgressCount = Math.min(20, (session.hlsLevelProgressCount || 0) + 1);
+        if (session.hlsLevelProgressCount < HLS_KEEPER_LEVEL_RESTORE_PROGRESS_COUNT) return;
+
+        hls = session.hls;
+        previousCap = session.hlsLevelCapBeforeKeeper;
+
+        try {
+            hls.autoLevelCapping = previousCap === null || previousCap === undefined ? -1 : previousCap;
+            session.hlsLevelCapApplied = false;
+            session.hlsLevelCapBeforeKeeper = null;
+            session.hlsLevelProgressCount = 0;
+            log('hls keeper restored level cap, reason =', reason || 'progress');
+        } catch (e) {
+            warn('failed to restore hls level cap', e);
         }
     }
 
@@ -2548,7 +2675,6 @@ var PLUGIN_VERSION = '1.2.0';
         var hls;
         var now;
         var desiredAhead;
-        var currentTime;
         var noGrowthFor;
         var shouldSoftRestart;
 
@@ -2565,7 +2691,6 @@ var PLUGIN_VERSION = '1.2.0';
         now = Date.now();
         if (now - session.lastHlsKeeperAt < HLS_KEEPER_COOLDOWN_MS) return;
 
-        currentTime = toNumber(session.video.currentTime, -1);
         noGrowthFor = session.lastHlsBufferGrowthAt ? now - session.lastHlsBufferGrowthAt : 0;
         shouldSoftRestart = noGrowthFor >= HLS_KEEPER_STALLED_MS &&
             now - session.lastHlsSoftRestartAt >= HLS_KEEPER_STOPSTART_COOLDOWN_MS &&
@@ -2577,11 +2702,13 @@ var PLUGIN_VERSION = '1.2.0';
             if (shouldSoftRestart) {
                 hls.stopLoad();
                 session.lastHlsSoftRestartAt = now;
+                session.hlsKeeperStallCount = Math.min(10, (session.hlsKeeperStallCount || 0) + 1);
                 session.lastStartLoadAt = 0;
+                maybeLowerHlsLevelForKeeper(session, reason);
                 log('hls loader soft restart, reason =', reason || 'keeper', 'ahead =', info.ahead, 'target =', desiredAhead);
             }
 
-            hls.startLoad(currentTime);
+            hls.startLoad();
             session.lastHlsKeeperAt = now;
             session.lastStartLoadAt = now;
 
@@ -2959,6 +3086,7 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         maybeRampHlsNetworkTarget(session, info, reason || 'evaluate');
+        maybeExpandHlsCeiling(session, info, reason || 'evaluate');
 
         beginPrebufferIfNeeded(session, reason || 'evaluate');
 
