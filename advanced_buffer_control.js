@@ -102,6 +102,9 @@ var PLUGIN_VERSION = '1.2.0';
     var HLS_NETWORK_CRITICAL_TARGET_SEC = 30;
     var HLS_NETWORK_LOW_BUFFER_RETRY_SEC = 25;
     var HLS_NETWORK_RECOVERY_HOLD_MS = 120000;
+    var HLS_NETWORK_RAMP_STEP_SEC = 30;
+    var HLS_NETWORK_RAMP_SUCCESS_COUNT = 2;
+    var HLS_NETWORK_RAMP_MIN_INTERVAL_MS = 5000;
     var HLS_BUFFER_CONFIG_FIELDS = [
         'maxBufferLength',
         'maxMaxBufferLength',
@@ -1020,7 +1023,10 @@ var PLUGIN_VERSION = '1.2.0';
                 lastHlsNetworkRetryAt: 0,
                 lastHlsNetworkErrorReason: '',
                 hlsNetworkTargetSec: 0,
-                hlsNetworkLimitUntil: 0
+                hlsNetworkLimitUntil: 0,
+                hlsNetworkSuccessCount: 0,
+                lastHlsNetworkProgressAt: 0,
+                lastHlsNetworkRampAt: 0
             };
         }
 
@@ -1179,6 +1185,9 @@ var PLUGIN_VERSION = '1.2.0';
         session.lastHlsNetworkErrorReason = '';
         session.hlsNetworkTargetSec = 0;
         session.hlsNetworkLimitUntil = 0;
+        session.hlsNetworkSuccessCount = 0;
+        session.lastHlsNetworkProgressAt = 0;
+        session.lastHlsNetworkRampAt = 0;
     }
 
     function markStablePlayback(session) {
@@ -1201,11 +1210,14 @@ var PLUGIN_VERSION = '1.2.0';
             session.hlsNetworkRetryCount = 0;
             session.lastHlsNetworkRetryAt = 0;
             session.lastHlsNetworkErrorReason = '';
+            session.hlsNetworkSuccessCount = 0;
         }
 
         if (session.hlsNetworkTargetSec && session.hlsNetworkLimitUntil && Date.now() >= session.hlsNetworkLimitUntil) {
             session.hlsNetworkTargetSec = 0;
             session.hlsNetworkLimitUntil = 0;
+            session.hlsNetworkSuccessCount = 0;
+            session.lastHlsNetworkRampAt = 0;
 
             if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
                 applyHlsRuntimeConfig(session.hls, session);
@@ -1910,6 +1922,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         session.hlsNetworkTargetSec = roundToSafeStep(Math.min(session.targetSec || getInitialTargetSec(), cap));
         session.hlsNetworkLimitUntil = now + HLS_NETWORK_RECOVERY_HOLD_MS;
+        session.hlsNetworkSuccessCount = 0;
         session.predictorHoldProbeUntil = Math.max(session.predictorHoldProbeUntil || 0, session.hlsNetworkLimitUntil);
         session.lastProbeAt = now;
 
@@ -1919,10 +1932,60 @@ var PLUGIN_VERSION = '1.2.0';
     }
 
     function markHlsNetworkProgress(session) {
+        var now = Date.now();
+        var currentCap;
+        var nextCap;
+        var target;
+
         if (!session) return;
 
-        session.hlsNetworkRetryCount = 0;
+        session.lastHlsNetworkProgressAt = now;
         session.lastHlsNetworkErrorReason = '';
+
+        if (!session.hlsNetworkTargetSec || !session.hlsNetworkLimitUntil || now >= session.hlsNetworkLimitUntil) {
+            session.hlsNetworkRetryCount = 0;
+            session.hlsNetworkSuccessCount = 0;
+            return;
+        }
+
+        session.hlsNetworkSuccessCount = Math.min(20, (session.hlsNetworkSuccessCount || 0) + 1);
+
+        if (session.hlsNetworkSuccessCount < HLS_NETWORK_RAMP_SUCCESS_COUNT) return;
+        if (session.lastHlsNetworkRampAt && now - session.lastHlsNetworkRampAt < HLS_NETWORK_RAMP_MIN_INTERVAL_MS) return;
+
+        target = session.targetSec || getInitialTargetSec();
+        currentCap = session.hlsNetworkTargetSec;
+        nextCap = roundToSafeStep(Math.min(target, currentCap + HLS_NETWORK_RAMP_STEP_SEC));
+
+        session.hlsNetworkSuccessCount = 0;
+        session.lastHlsNetworkRampAt = now;
+
+        if (nextCap >= target) {
+            session.hlsNetworkTargetSec = 0;
+            session.hlsNetworkLimitUntil = 0;
+            session.hlsNetworkRetryCount = 0;
+            session.lastHlsNetworkRetryAt = 0;
+            session.predictorHoldProbeUntil = 0;
+
+            if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
+                applyHlsRuntimeConfig(session.hls, session);
+            }
+
+            log('hls network target cap released after buffered fragments, target =', target);
+            return;
+        }
+
+        session.hlsNetworkTargetSec = nextCap;
+        session.hlsNetworkLimitUntil = now + HLS_NETWORK_RECOVERY_HOLD_MS;
+        session.hlsNetworkRetryCount = 0;
+        session.lastHlsNetworkRetryAt = 0;
+        session.predictorHoldProbeUntil = Math.max(session.predictorHoldProbeUntil || 0, session.hlsNetworkLimitUntil);
+
+        if (session.hls && shouldUseBufferingForPlayData(session.playData)) {
+            applyHlsRuntimeConfig(session.hls, session);
+        }
+
+        log('hls network target cap raised after progress, cap =', session.hlsNetworkTargetSec);
     }
 
     function restartHlsNetworkLoad(session, reason) {
