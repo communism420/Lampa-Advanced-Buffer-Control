@@ -1,5 +1,7 @@
 # Advanced Buffer Control
 
+Version: **1.2.0**
+
 ## Русский
 
 **Advanced Buffer Control** — плагин для Lampa, который управляет буфером для VOD-видео.
@@ -8,7 +10,7 @@
 
 ### Что умеет
 
-- Добавляет два переключателя в **Настройки -> Плеер**.
+- Добавляет один переключатель в **Настройки -> Плеер**.
 - Для `.m3u8`, который не выглядит как live/IPTV, просит Lampa использовать `hls.js`, если он доступен.
 - Для HLS VOD увеличивает целевой буфер, стартуя с 480 секунд.
 - Постоянно поддерживает HLS-загрузку до текущего target во время воспроизведения и на паузе.
@@ -16,7 +18,6 @@
 - Запоминает найденный HLS-лимит в `Lampa.Storage` и использует его в следующих сессиях.
 - Держит back-buffer коротким: около 20 секунд позади текущей позиции.
 - При стабильной работе постепенно пробует поднять лимит выше.
-- Опционально удерживает старт воспроизведения, пока не набрано около 15 секунд буфера.
 - Заранее реагирует на риск остановки: учитывает прирост буфера, расход буфера, `waiting` / `stalled` / `suspend` и временно блокирует повышение target.
 - Для обычного `video` включает `preload="auto"` и аккуратно подталкивает загрузку коротким seek только при низком буфере.
 
@@ -50,12 +51,6 @@
 - при низком буфере и активном воспроизведении делает короткий seek вперёд-назад, чтобы подтолкнуть догрузку;
 - не делает такие seek, пока пользователь поставил фильм на паузу.
 
-### Предзагрузка перед стартом
-
-Если включён переключатель **Предзагрузка перед стартом**, плагин ставит воспроизведение на паузу в начале сессии и ждёт, пока впереди не будет около 15 секунд буфера.
-
-Это полезно для слабых сетей, где мгновенный старт часто приводит к `waiting` / `stalled`. После набора целевого буфера плагин сам продолжает воспроизведение, если пользователь не остановил его во время предзагрузки.
-
 ### Предиктор остановок
 
 Плагин отслеживает, насколько быстро буфер растёт и расходуется. Если буфер тает быстрее, чем загружается, или появляются события `waiting`, `stalled`, `suspend`, он заранее:
@@ -69,9 +64,8 @@
 ### Настройки
 
 - **Умное заполнение буфера** — включает или выключает адаптивное заполнение буфера.
-- **Предзагрузка перед стартом** — удерживает старт, пока не набрано около 15 секунд буфера.
 
-Умное заполнение буфера включено по умолчанию. Предзагрузка перед стартом выключена по умолчанию.
+Умное заполнение буфера включено по умолчанию.
 
 ### Установка
 
@@ -97,7 +91,7 @@ The plugin does not add an external segment cache and does not replace the `hls.
 
 ### Features
 
-- Adds two switches to **Settings -> Player**.
+- Adds one switch to **Settings -> Player**.
 - Asks Lampa to use `hls.js` for `.m3u8` streams that do not look like live/IPTV, when available.
 - Increases the HLS VOD target buffer, starting from 480 seconds.
 - Keeps HLS loading toward the current target during playback and while paused.
@@ -105,7 +99,6 @@ The plugin does not add an external segment cache and does not replace the `hls.
 - Stores the learned HLS limit in `Lampa.Storage` and reuses it in later sessions.
 - Keeps the back-buffer short: about 20 seconds behind the current position.
 - Gradually probes higher limits after stable playback.
-- Optionally holds playback start until about 15 seconds are buffered.
 - Predicts stalls by watching buffer growth, buffer drain and `waiting` / `stalled` / `suspend`, then temporarily blocks target probing.
 - For regular `video`, enables `preload="auto"` and gently nudges loading with a short seek only when the buffer is low.
 
@@ -139,12 +132,6 @@ Instead it:
 - when playback is active and the buffer is low, performs a short forward/back seek to nudge loading;
 - skips this seek while the user has paused playback.
 
-### Prebuffer Before Start
-
-When **Prebuffer Before Start** is enabled, the plugin pauses playback at the beginning of a session and waits until roughly 15 seconds are buffered ahead.
-
-This is useful on weak networks where instant playback often leads to `waiting` / `stalled`. Once the target buffer is reached, playback resumes automatically unless the user paused it during prebuffering.
-
 ### Stall Predictor
 
 The plugin tracks how quickly the buffer grows and drains. If the buffer is draining faster than it loads, or `waiting`, `stalled`, `suspend` events appear, it proactively:
@@ -158,9 +145,8 @@ HLS also has a continuous buffer keeper. It does not wait for a low-buffer state
 ### Settings
 
 - **Smart Buffer Fill** — enables or disables adaptive buffering.
-- **Prebuffer Before Start** — holds playback start until about 15 seconds are buffered.
 
-Smart buffering is enabled by default. Prebuffer before start is disabled by default.
+Smart buffering is enabled by default.
 
 ### Installation
 
