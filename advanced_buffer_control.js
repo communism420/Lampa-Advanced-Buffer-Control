@@ -32,7 +32,6 @@ console.log('[Advanced Buffer Control] v1.2.0: file begin');
     var PLUGIN_NAME = 'Advanced Buffer Control';
 var PLUGIN_VERSION = '1.2.0';
     var ENABLED_KEY = 'advanced_buffer_control_enabled';
-    var PREBUFFER_ENABLED_KEY = 'advanced_buffer_control_prebuffer_enabled';
     var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
     var LEARNED_LIMIT_MIGRATION_KEY = 'advanced_buffer_control_learned_limit_migration_v120';
     var MENU_TEXT = {
@@ -43,22 +42,12 @@ var PLUGIN_VERSION = '1.2.0';
         enabled_description: {
             ru: 'Автоматически заполнять буфер до фактического предела устройства',
             en: 'Automatically fill the buffer up to the actual device limit'
-        },
-        prebuffer_name: {
-            ru: 'Предзагрузка перед стартом',
-            en: 'Prebuffer Before Start'
-        },
-        prebuffer_description: {
-            ru: 'Не начинать воспроизведение, пока не набрано около 15 секунд буфера',
-            en: 'Do not start playback until about 15 seconds are buffered'
         }
     };
 
     // Значения по умолчанию и безопасные пределы.
     var ENABLED_DEFAULT = true;
-    var PREBUFFER_ENABLED_DEFAULT = false;
     var MIN_TARGET_SEC = 15;
-    var PREBUFFER_TARGET_SEC = 15;
     var DISCOVERY_START_SEC = 480;
     var ABSOLUTE_MAX_SEC = 900;
     var SAFE_MARGIN_AFTER_ERROR_SEC = 15;
@@ -86,7 +75,6 @@ var PLUGIN_VERSION = '1.2.0';
     var STALL_PREDICTOR_HOLD_MS = 30000;
     var STALL_PREDICTOR_ACTION_COOLDOWN_MS = 5000;
     var STALL_SIGNAL_WINDOW_MS = 15000;
-    var PREBUFFER_INTERNAL_PAUSE_GUARD_MS = 300;
     var HLS_LOW_LEARNED_LIMIT_HOLD_MS = 120000;
     var HLS_CEILING_EXPAND_INTERVAL_MS = 5000;
     var HLS_CEILING_EXPAND_MARGIN_SEC = 8;
@@ -197,23 +185,9 @@ var PLUGIN_VERSION = '1.2.0';
         return String(value) === 'true';
     }
 
-    function isPrebufferEnabled() {
-        var value;
-
-        if (!isPluginEnabled()) return false;
-
-        try {
-            value = Lampa.Storage.get(PREBUFFER_ENABLED_KEY, PREBUFFER_ENABLED_DEFAULT);
-        } catch (e) {
-            value = PREBUFFER_ENABLED_DEFAULT;
-        }
-
-        return String(value) === 'true';
-    }
-
-    // Проверяем, включена ли хотя бы одна функция плагина.
+    // Проверяем, включён ли основной функционал плагина.
     function isAnyFeatureEnabled() {
-        return isPluginEnabled() || isPrebufferEnabled();
+        return isPluginEnabled();
     }
 
     // Читаем запомненный безопасный предел устройства.
@@ -376,14 +350,6 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         try {
-            if (Lampa.Storage.get(PREBUFFER_ENABLED_KEY, null) === null) {
-                Lampa.Storage.set(PREBUFFER_ENABLED_KEY, PREBUFFER_ENABLED_DEFAULT);
-            }
-        } catch (e0) {
-            warn('failed to normalize prebuffer flag', e0);
-        }
-
-        try {
             storedMigration = String(Lampa.Storage.get(LEARNED_LIMIT_MIGRATION_KEY, '') || '');
             storedLimit = toNumber(Lampa.Storage.get(LEARNED_LIMIT_KEY, 0), 0);
 
@@ -437,19 +403,6 @@ var PLUGIN_VERSION = '1.2.0';
 
                 applyDefaultHlsConfig(window.Hls, state.currentSession && state.currentSession.playData);
                 syncCurrentSession('settings-change');
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'player',
-            param: {
-                name: PREBUFFER_ENABLED_KEY,
-                type: 'trigger',
-                default: PREBUFFER_ENABLED_DEFAULT
-            },
-            field: createLocalizedField('prebuffer_name', 'prebuffer_description'),
-            onChange: function () {
-                syncCurrentSession('prebuffer-settings-change');
             }
         });
     }
@@ -847,13 +800,6 @@ var PLUGIN_VERSION = '1.2.0';
                 lastBackBufferFlushEndOffset: 0,
                 observedMaxAhead: 0,
                 lastBufferInfo: { ahead: 0, end: 0 },
-                prebufferInProgress: false,
-                prebufferDone: false,
-                prebufferStartedAt: 0,
-                prebufferWasPaused: false,
-                prebufferInternalPause: false,
-                prebufferPauseGuardTimer: null,
-                lastUserPauseAt: 0,
                 predictorLastAt: 0,
                 predictorLastAhead: 0,
                 predictorLastEnd: 0,
@@ -983,15 +929,8 @@ var PLUGIN_VERSION = '1.2.0';
             session.nativeKickReleaseTimer = null;
         }
 
-        if (session.prebufferPauseGuardTimer) {
-            clearTimeout(session.prebufferPauseGuardTimer);
-            session.prebufferPauseGuardTimer = null;
-        }
-
         session.nativeKickInProgress = false;
         session.nativeKickReturnTo = null;
-        session.prebufferInProgress = false;
-        session.prebufferInternalPause = false;
     }
 
     function markStablePlayback(session) {
@@ -1279,143 +1218,6 @@ var PLUGIN_VERSION = '1.2.0';
             end: current,
             source: 'none'
         };
-    }
-
-    function getPrebufferTargetSec(video) {
-        var current;
-        var duration;
-        var remaining;
-
-        if (!video) return PREBUFFER_TARGET_SEC;
-
-        current = toNumber(video.currentTime, 0);
-        duration = toNumber(video.duration, 0);
-
-        if (isFinite(duration) && duration > 0) {
-            remaining = duration - current;
-            if (remaining <= 3) return 0;
-            return Math.max(2, Math.min(PREBUFFER_TARGET_SEC, remaining - 1));
-        }
-
-        return PREBUFFER_TARGET_SEC;
-    }
-
-    function canUsePrebuffer(session) {
-        if (!session || session.destroyed || !session.video) return false;
-        if (!isPrebufferEnabled()) return false;
-        if (!shouldUseBufferingForPlayData(session.playData)) return false;
-        if (session.prebufferDone) return false;
-
-        return getPrebufferTargetSec(session.video) > 0;
-    }
-
-    function beginPrebufferIfNeeded(session, reason) {
-        var video;
-        var info;
-        var target;
-        var now;
-
-        if (!canUsePrebuffer(session) || session.prebufferInProgress) return;
-
-        video = session.video;
-        info = getForwardBufferInfo(video, session.hls);
-        target = getPrebufferTargetSec(video);
-        now = Date.now();
-
-        if (info.ahead >= target) {
-            session.prebufferDone = true;
-            return;
-        }
-
-        session.prebufferInProgress = true;
-        session.prebufferStartedAt = now;
-        session.prebufferWasPaused = !!(session.lastUserPauseAt && now - session.lastUserPauseAt < 5000);
-
-        try {
-            session.prebufferInternalPause = true;
-            video.pause();
-
-            if (session.prebufferPauseGuardTimer) clearTimeout(session.prebufferPauseGuardTimer);
-            session.prebufferPauseGuardTimer = setTimeout(function () {
-                session.prebufferInternalPause = false;
-                session.prebufferPauseGuardTimer = null;
-            }, PREBUFFER_INTERNAL_PAUSE_GUARD_MS);
-        } catch (e) {
-            session.prebufferInternalPause = false;
-            // Если pause недоступен, дальнейшая логика всё равно попробует набрать буфер.
-        }
-
-        if (session.hls) {
-            forceHlsBuffer(session, reason || 'prebuffer-start');
-        } else {
-            try {
-                video.load();
-            } catch (e2) {
-                // Не критично: preload всё равно выставлен в prepareVideoElement().
-            }
-        }
-
-        log('prebuffer started, target =', target, 'sec, reason =', reason || 'unknown');
-    }
-
-    function releasePrebuffer(session, reason) {
-        var video;
-
-        if (!session || !session.prebufferInProgress) return;
-
-        video = session.video || getCurrentVideo();
-        session.prebufferInProgress = false;
-        session.prebufferDone = true;
-        session.prebufferInternalPause = false;
-
-        if (session.prebufferPauseGuardTimer) {
-            clearTimeout(session.prebufferPauseGuardTimer);
-            session.prebufferPauseGuardTimer = null;
-        }
-
-        log('prebuffer finished, reason =', reason || 'ready');
-
-        if (video && !session.prebufferWasPaused) {
-            safePlay(video);
-        }
-    }
-
-    function maintainPrebuffer(session, info, reason) {
-        var video;
-        var target;
-
-        if (!session || !session.prebufferInProgress) return false;
-
-        video = session.video;
-        target = getPrebufferTargetSec(video);
-
-        if (!isPrebufferEnabled() || !shouldUseBufferingForPlayData(session.playData) || target <= 0) {
-            releasePrebuffer(session, 'disabled');
-            return false;
-        }
-
-        if (info && info.ahead >= target) {
-            releasePrebuffer(session, reason || 'target-reached');
-            return false;
-        }
-
-        try {
-            if (video && !video.paused) video.pause();
-        } catch (e) {
-            // Не критично.
-        }
-
-        if (session.hls) {
-            forceHlsBuffer(session, 'prebuffer');
-        } else if (video && typeof video.load === 'function') {
-            try {
-                video.load();
-            } catch (e2) {
-                // Не критично.
-            }
-        }
-
-        return true;
     }
 
     // Освобождаем старый хвост позади текущей позиции, чтобы не тратить квоту MSE на уже просмотренное.
@@ -1733,7 +1535,6 @@ var PLUGIN_VERSION = '1.2.0';
 
         if (!session || session.destroyed || !session.video || !info) return;
         if (!shouldUseBufferingForPlayData(session.playData)) return;
-        if (session.prebufferInProgress) return;
 
         now = Date.now();
         current = toNumber(session.video.currentTime, 0);
@@ -1838,8 +1639,6 @@ var PLUGIN_VERSION = '1.2.0';
         session.lastBufferInfo = { ahead: 0, end: 0 };
         session.backBufferFlushPostpones = 0;
         session.backBufferFlushTargetSec = 0;
-        if (session.prebufferInProgress) releasePrebuffer(session, 'live-detected');
-        session.prebufferDone = true;
 
         if (marked) applyDefaultHlsConfig(window.Hls, session.playData);
 
@@ -2023,12 +1822,6 @@ var PLUGIN_VERSION = '1.2.0';
 
         maybeExpandHlsCeiling(session, info, reason || 'evaluate');
 
-        beginPrebufferIfNeeded(session, reason || 'evaluate');
-
-        if (maintainPrebuffer(session, info, reason || 'evaluate')) {
-            return;
-        }
-
         keepHlsBufferFilling(session, info, reason || 'evaluate');
 
         updateStallPredictor(session, info, reason || 'evaluate');
@@ -2121,29 +1914,12 @@ var PLUGIN_VERSION = '1.2.0';
                 evaluateSession('error');
             },
             pause: function () {
-                if (session.prebufferInternalPause) return;
-
-                session.lastUserPauseAt = Date.now();
-
-                if (session.prebufferInProgress) {
-                    session.prebufferWasPaused = true;
-                    log('prebuffer will stay paused after user pause');
-                }
+                evaluateSession('pause');
             },
             play: function () {
-                if (session.prebufferInProgress) {
-                    maintainPrebuffer(session, getForwardBufferInfo(session.video, session.hls), 'play');
-                    return;
-                }
-
                 evaluateSession('play');
             },
             playing: function () {
-                if (session.prebufferInProgress) {
-                    maintainPrebuffer(session, getForwardBufferInfo(session.video, session.hls), 'playing');
-                    return;
-                }
-
                 markStablePlayback(session);
                 evaluateSession('playing');
             }
