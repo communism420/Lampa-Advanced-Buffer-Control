@@ -1,13 +1,13 @@
 /*
  * Advanced Buffer Control / Умный большой буфер
-* Версия: 1.2.0
+ * Версия: 1.3.0
  *
  * Эта версия делает только то, что реально безопасно на Android / Android TV:
  * - добавляет переключатели в существующий раздел настроек плеера;
  * - если плагин включён, то старается заполнять буфер не только для HLS, но и для обычного video-воспроизведения;
- * - предел определяется автоматически по non-fatal ошибкам bufferFullError / bufferAppendingError;
- * - найденный предел запоминается в Storage и используется на следующих запусках;
- * - при стабильном воспроизведении плагин понемногу пробует поднять предел выше, чтобы адаптироваться под конкретное устройство.
+ * - бюджет памяти определяется по bufferFullError и хранится в байтах, а не секундах;
+ * - найденный бюджет запоминается в Storage и используется на следующих запусках;
+ * - при стабильном воспроизведении плагин понемногу пробует поднять бюджет выше, чтобы адаптироваться под конкретное устройство.
  *
  * Важно:
  * - никакого кастомного fLoader здесь нет;
@@ -17,12 +17,12 @@
 (function () {
     'use strict';
 
-console.log('[Advanced Buffer Control] v1.2.0: file begin');
+console.log('[Advanced Buffer Control] v1.3.0: file begin');
 
     // Защита от повторной инициализации.
     if (window.advanced_buffer_control_plugin_ready_v1) {
-    console.log('[Advanced Buffer Control] v1.2.0: already initialized');
-    console.log('[Advanced Buffer Control] v1.2.0: file end');
+        console.log('[Advanced Buffer Control] v1.3.0: already initialized');
+        console.log('[Advanced Buffer Control] v1.3.0: file end');
         return;
     }
 
@@ -30,10 +30,11 @@ console.log('[Advanced Buffer Control] v1.2.0: file begin');
 
     // Основные идентификаторы плагина и ключи Storage.
     var PLUGIN_NAME = 'Advanced Buffer Control';
-var PLUGIN_VERSION = '1.2.0';
+    var PLUGIN_VERSION = '1.3.0';
     var ENABLED_KEY = 'advanced_buffer_control_enabled';
-    var LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
-    var LEARNED_LIMIT_MIGRATION_KEY = 'advanced_buffer_control_learned_limit_migration_v120';
+    var LEARNED_BUDGET_KEY = 'advanced_buffer_control_learned_budget_bytes';
+    var LEARNED_BUDGET_MIGRATION_KEY = 'advanced_buffer_control_budget_migration_v130';
+    var LEGACY_LEARNED_LIMIT_KEY = 'advanced_buffer_control_learned_limit_sec';
     var MENU_TEXT = {
         enabled_name: {
             ru: 'Умное заполнение буфера',
@@ -48,11 +49,14 @@ var PLUGIN_VERSION = '1.2.0';
     // Значения по умолчанию и безопасные пределы.
     var ENABLED_DEFAULT = true;
     var MIN_TARGET_SEC = 15;
-    var DISCOVERY_START_SEC = 480;
     var ABSOLUTE_MAX_SEC = 900;
     var SAFE_MARGIN_AFTER_ERROR_SEC = 15;
-    var SUSPICIOUS_LEARNED_LIMIT_SEC = 60;
-    var PROBE_STEP_SEC = 30;
+    var MEBIBYTE = 1024 * 1024;
+    var DEFAULT_BUFFER_BUDGET_BYTES = 64 * MEBIBYTE;
+    var MIN_BUFFER_BUDGET_BYTES = 32 * MEBIBYTE;
+    var MAX_BUFFER_BUDGET_BYTES = 512 * MEBIBYTE;
+    var PROBE_STEP_BYTES = 16 * MEBIBYTE;
+    var FALLBACK_BITRATE_BPS = 8000000;
     var PROBE_MARGIN_SEC = 20;
     var LOW_BUFFER_THRESHOLD_SEC = 55;
     var WATCHDOG_INTERVAL = 2000;
@@ -75,9 +79,6 @@ var PLUGIN_VERSION = '1.2.0';
     var STALL_PREDICTOR_HOLD_MS = 30000;
     var STALL_PREDICTOR_ACTION_COOLDOWN_MS = 5000;
     var STALL_SIGNAL_WINDOW_MS = 15000;
-    var HLS_LOW_LEARNED_LIMIT_HOLD_MS = 120000;
-    var HLS_CEILING_EXPAND_INTERVAL_MS = 5000;
-    var HLS_CEILING_EXPAND_MARGIN_SEC = 8;
     var HLS_BUFFER_CONFIG_FIELDS = [
         'maxBufferLength',
         'maxMaxBufferLength',
@@ -92,10 +93,7 @@ var PLUGIN_VERSION = '1.2.0';
     // Общее состояние плагина.
     var state = {
         hlsPatched: false,
-        originalHlsDefaults: null,
-        defaultHlsDefaultsBeforeApply: null,
-        defaultConfigApplied: false,
-        lastHls: null,
+        patchedHlsCtor: null,
         currentSession: null,
         errorCleanerBound: false,
         startToken: 0
@@ -164,9 +162,8 @@ var PLUGIN_VERSION = '1.2.0';
         return isFinite(num) ? num : fallback;
     }
 
-    // Округляем секунды до шага 15 секунд, чтобы limit в Storage не прыгал хаотично.
-    function roundToSafeStep(seconds) {
-        seconds = Math.round(seconds / 15) * 15;
+    function roundDownToSafeStep(seconds) {
+        seconds = Math.floor(seconds / 15) * 15;
         if (seconds < MIN_TARGET_SEC) seconds = MIN_TARGET_SEC;
         if (seconds > ABSOLUTE_MAX_SEC) seconds = ABSOLUTE_MAX_SEC;
         return seconds;
@@ -190,37 +187,39 @@ var PLUGIN_VERSION = '1.2.0';
         return isPluginEnabled();
     }
 
-    // Читаем запомненный безопасный предел устройства.
-    function getLearnedLimitSec() {
+    function clampBufferBudgetBytes(bytes) {
+        bytes = Math.round(toNumber(bytes, 0));
+        if (bytes < MIN_BUFFER_BUDGET_BYTES) bytes = MIN_BUFFER_BUDGET_BYTES;
+        if (bytes > MAX_BUFFER_BUDGET_BYTES) bytes = MAX_BUFFER_BUDGET_BYTES;
+        return bytes;
+    }
+
+    // Читаем сохранённый бюджет памяти MSE. Байты, а не секунды, остаются
+    // осмысленными при смене качества и битрейта.
+    function getLearnedBufferBudgetBytes() {
         var value;
 
         try {
-            value = toNumber(Lampa.Storage.get(LEARNED_LIMIT_KEY, 0), 0);
+            value = toNumber(Lampa.Storage.get(LEARNED_BUDGET_KEY, 0), 0);
         } catch (e) {
             value = 0;
         }
 
-        if (!isFinite(value) || value < MIN_TARGET_SEC) return 0;
-        if (value > ABSOLUTE_MAX_SEC) value = ABSOLUTE_MAX_SEC;
-
-        return roundToSafeStep(value);
+        return isFinite(value) && value >= MIN_BUFFER_BUDGET_BYTES ? clampBufferBudgetBytes(value) : 0;
     }
 
-    // Сохраняем найденный безопасный предел.
-    function saveLearnedLimitSec(seconds) {
-        seconds = roundToSafeStep(seconds);
+    function saveLearnedBufferBudgetBytes(bytes) {
+        bytes = clampBufferBudgetBytes(bytes);
 
         try {
-            Lampa.Storage.set(LEARNED_LIMIT_KEY, String(seconds));
+            Lampa.Storage.set(LEARNED_BUDGET_KEY, String(bytes));
         } catch (e) {
-            warn('failed to save learned limit', e);
+            warn('failed to save learned buffer budget', e);
         }
     }
 
-    // Стартовый target для новой сессии.
-    function getInitialTargetSec() {
-        var learned = getLearnedLimitSec();
-        return learned || DISCOVERY_START_SEC;
+    function getInitialBufferBudgetBytes() {
+        return getLearnedBufferBudgetBytes() || DEFAULT_BUFFER_BUDGET_BYTES;
     }
 
     // Проверка, что URL — это HLS m3u8.
@@ -248,9 +247,9 @@ var PLUGIN_VERSION = '1.2.0';
 
         text = text.toLowerCase();
 
-        return /(^|[?&#])(live|is_live|iptv|tv|channel|ch)=(1|true|yes|on)($|[&#])/i.test(text) ||
+        return /(^|[?&#])(live|is_live|iptv)=(1|true|yes|on)($|[&#])/i.test(text) ||
             /(^|[?&#])(type|mode|playlist)=live($|[&#])/i.test(text) ||
-            /(^|\/)(live|iptv|tv|channels?|broadcast)(\/|$)/i.test(text);
+            /(^|\/)(live|iptv|broadcast)(\/|$)/i.test(text);
     }
 
     function isHlsPlayData(playData) {
@@ -311,16 +310,19 @@ var PLUGIN_VERSION = '1.2.0';
         return true;
     }
 
+    function isExplicitlyTrue(value) {
+        return value === true || value === 1 || value === '1' || value === 'true';
+    }
+
     function isLiveLikePlayData(playData) {
         if (!playData) return false;
 
         return !!(
             playData[LIVE_LIKE_FLAG] ||
-            playData.iptv ||
-            playData.tv ||
-            playData.live ||
-            playData.need_check_live_stream ||
-            playData.channel ||
+            isExplicitlyTrue(playData.iptv) ||
+            isExplicitlyTrue(playData.tv) ||
+            isExplicitlyTrue(playData.live) ||
+            isExplicitlyTrue(playData.channel) ||
             isLiveLikeUrl(getPlayDataUrl(playData))
         );
     }
@@ -339,7 +341,6 @@ var PLUGIN_VERSION = '1.2.0';
     // Инициализируем дефолтные значения Storage.
     function normalizeStorage() {
         var storedMigration;
-        var storedLimit;
 
         try {
             if (Lampa.Storage.get(ENABLED_KEY, null) === null) {
@@ -350,30 +351,42 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         try {
-            storedMigration = String(Lampa.Storage.get(LEARNED_LIMIT_MIGRATION_KEY, '') || '');
-            storedLimit = toNumber(Lampa.Storage.get(LEARNED_LIMIT_KEY, 0), 0);
+            storedMigration = String(Lampa.Storage.get(LEARNED_BUDGET_MIGRATION_KEY, '') || '');
 
             if (storedMigration !== PLUGIN_VERSION) {
-                if (storedLimit > 0 && storedLimit < SUSPICIOUS_LEARNED_LIMIT_SEC) {
-                    Lampa.Storage.set(LEARNED_LIMIT_KEY, '0');
-                    log('old suspicious learned buffer limit reset =', storedLimit, 'sec');
+                // Лимит в секундах из 1.2.0 нельзя безопасно преобразовать:
+                // один и тот же хронометраж может занимать 30 МБ или 1 ГБ.
+                if (!getLearnedBufferBudgetBytes()) {
+                    Lampa.Storage.set(LEARNED_BUDGET_KEY, '0');
                 }
-
-                Lampa.Storage.set(LEARNED_LIMIT_MIGRATION_KEY, PLUGIN_VERSION);
+                Lampa.Storage.set(LEGACY_LEARNED_LIMIT_KEY, '0');
+                Lampa.Storage.set(LEARNED_BUDGET_MIGRATION_KEY, PLUGIN_VERSION);
             }
         } catch (e2) {
-            warn('failed to migrate learned limit', e2);
+            warn('failed to migrate learned buffer budget', e2);
         }
 
         try {
-            var learned = getLearnedLimitSec();
+            var learned = getLearnedBufferBudgetBytes();
 
             if (learned > 0) {
-                Lampa.Storage.set(LEARNED_LIMIT_KEY, String(learned));
+                Lampa.Storage.set(LEARNED_BUDGET_KEY, String(learned));
             }
         } catch (e3) {
-            warn('failed to normalize learned limit', e3);
+            warn('failed to normalize learned buffer budget', e3);
         }
+    }
+
+    function getCurrentPlayData() {
+        try {
+            if (Lampa && Lampa.Player && typeof Lampa.Player.playdata === 'function') {
+                return Lampa.Player.playdata();
+            }
+        } catch (e) {
+            warn('failed to read current play data', e);
+        }
+
+        return null;
     }
 
     // Добавляем параметры прямо в существующий раздел настроек плеера.
@@ -395,14 +408,25 @@ var PLUGIN_VERSION = '1.2.0';
             field: createLocalizedField('enabled_name', 'enabled_description'),
             onChange: function (value) {
                 var enabled = String(value) === 'true';
+                var playData;
+
+                try {
+                    Lampa.Storage.set(ENABLED_KEY, enabled);
+                } catch (e) {
+                    warn('failed to save enabled flag', e);
+                }
 
                 if (!enabled) {
                     state.startToken += 1;
-                    destroyCurrentSession();
+                    destroyCurrentSession(true);
+                    return;
                 }
 
-                applyDefaultHlsConfig(window.Hls, state.currentSession && state.currentSession.playData);
-                syncCurrentSession('settings-change');
+                playData = getCurrentPlayData();
+                if (!playData) return;
+
+                ensureHlsPatched(playData);
+                startPlayerSession(playData, 0, state.startToken);
             }
         });
     }
@@ -419,103 +443,71 @@ var PLUGIN_VERSION = '1.2.0';
         return result;
     }
 
-    function writeHlsBufferConfig(target, values) {
-        if (!target || !values) return;
+    function getHlsBitrateBps(session) {
+        var hls;
+        var level;
+        var bitrate = 0;
 
-        HLS_BUFFER_CONFIG_FIELDS.forEach(function (key) {
-            if (Object.prototype.hasOwnProperty.call(values, key)) {
-                target[key] = values[key];
+        if (!session) return FALLBACK_BITRATE_BPS;
+        hls = session.hls;
+
+        try {
+            if (hls && hls.levels && hls.levels.length) {
+                level = hls.levels[toNumber(hls.currentLevel, -1)] ||
+                    hls.levels[toNumber(hls.nextAutoLevel, -1)] ||
+                    hls.levels[toNumber(hls.loadLevel, -1)];
+                bitrate = toNumber(level && (level.realBitrate || level.bitrate || level.averageBitrate), 0);
             }
-        });
+        } catch (e) {
+            bitrate = 0;
+        }
+
+        if (bitrate > 0) {
+            session.maxObservedBitrateBps = Math.max(session.maxObservedBitrateBps || 0, bitrate);
+        }
+
+        return Math.max(FALLBACK_BITRATE_BPS, session.maxObservedBitrateBps || 0, bitrate || 0);
     }
 
-    // Сохраняем оригинальные дефолты hls.js, чтобы уметь корректно отключать плагин.
-    function captureOriginalHlsDefaults(HlsCtor) {
-        if (!HlsCtor || !HlsCtor.DefaultConfig) return;
-        if (state.originalHlsDefaults) return;
+    function refreshHlsTargetSec(session) {
+        var bitrate;
+        var target;
 
-        state.originalHlsDefaults = readHlsBufferConfig(HlsCtor.DefaultConfig);
-    }
+        if (!session) return MIN_TARGET_SEC;
 
-    // Вычисляем лимит по байтам так, чтобы hls.js не упирался в слишком маленький maxBufferSize раньше времени.
-    function getBufferSizeBytesForTarget(seconds) {
-        var estimated = Math.round(seconds * 900000);
-        var minBytes = 64 * 1024 * 1024;
-        var maxBytes = 512 * 1024 * 1024;
+        session.bufferBudgetBytes = clampBufferBudgetBytes(session.bufferBudgetBytes || getInitialBufferBudgetBytes());
+        bitrate = getHlsBitrateBps(session);
+        target = Math.floor(session.bufferBudgetBytes * 8 / bitrate);
+        session.targetSec = roundDownToSafeStep(target);
 
-        if (estimated < minBytes) estimated = minBytes;
-        if (estimated > maxBytes) estimated = maxBytes;
-
-        return estimated;
-    }
-
-    // Возвращаем текущий желаемый target в секундах.
-    // Если есть живая сессия, приоритет у её target.
-    function getCurrentDesiredTargetSec(session) {
-        if (session && session.targetSec) return session.targetSec;
-        return getInitialTargetSec();
+        return session.targetSec;
     }
 
     function getEffectiveHlsTargetSec(session) {
-        var target = getCurrentDesiredTargetSec(session);
-        var now = Date.now();
+        return refreshHlsTargetSec(session);
+    }
 
-        if (session && session.hls && target < DISCOVERY_START_SEC) {
-            if (!session.lastBufferErrorAt || now - session.lastBufferErrorAt >= HLS_LOW_LEARNED_LIMIT_HOLD_MS) {
-                target = DISCOVERY_START_SEC;
-            }
+    function restoreHlsRuntimeConfig(hls, force) {
+        var original;
+        var applied;
+
+        if (!hls || !hls.config) return;
+
+        original = hls.__advancedBufferRuntimeConfig;
+        applied = hls.__advancedBufferAppliedConfig;
+
+        if (original && applied) {
+            HLS_BUFFER_CONFIG_FIELDS.forEach(function (key) {
+                if (force || hls.config[key] === applied[key]) hls.config[key] = original[key];
+            });
         }
 
-        return roundToSafeStep(target);
-    }
-
-    function getPreferredHlsFillTargetSec(session) {
-        var target = getCurrentDesiredTargetSec(session);
-
-        if (target < DISCOVERY_START_SEC) target = DISCOVERY_START_SEC;
-        if (target > ABSOLUTE_MAX_SEC) target = ABSOLUTE_MAX_SEC;
-
-        return roundToSafeStep(target);
-    }
-
-    // Применяем дефолтный конфиг hls.js в зависимости от статуса переключателя.
-    function applyDefaultHlsConfig(HlsCtor, playData) {
-        var targetSec;
-        var shouldApply;
-
-        if (!HlsCtor || !HlsCtor.DefaultConfig) return;
-
-        captureOriginalHlsDefaults(HlsCtor);
-
         try {
-            shouldApply = shouldUseBufferingForPlayData(playData);
-
-            if (!shouldApply) {
-                if (state.defaultConfigApplied) {
-                    writeHlsBufferConfig(HlsCtor.DefaultConfig, state.defaultHlsDefaultsBeforeApply || state.originalHlsDefaults);
-                    state.defaultConfigApplied = false;
-                    state.defaultHlsDefaultsBeforeApply = null;
-                }
-                return;
-            }
-
-            if (!state.defaultConfigApplied) {
-                state.defaultHlsDefaultsBeforeApply = readHlsBufferConfig(HlsCtor.DefaultConfig);
-            }
-
-            targetSec = getEffectiveHlsTargetSec(
-                state.currentSession && state.currentSession.playData === playData ? state.currentSession : null
-            );
-
-            HlsCtor.DefaultConfig.maxBufferLength = targetSec;
-            HlsCtor.DefaultConfig.maxMaxBufferLength = targetSec;
-            HlsCtor.DefaultConfig.maxBufferSize = getBufferSizeBytesForTarget(targetSec);
-            HlsCtor.DefaultConfig.backBufferLength = BACK_BUFFER_KEEP_SEC;
-            HlsCtor.DefaultConfig.liveBackBufferLength = BACK_BUFFER_KEEP_SEC;
-            HlsCtor.DefaultConfig.lowLatencyMode = false;
-            state.defaultConfigApplied = true;
+            delete hls.__advancedBufferRuntimeConfig;
+            delete hls.__advancedBufferAppliedConfig;
         } catch (e) {
-            warn('failed to apply Hls.DefaultConfig', e);
+            hls.__advancedBufferRuntimeConfig = null;
+            hls.__advancedBufferAppliedConfig = null;
         }
     }
 
@@ -523,33 +515,32 @@ var PLUGIN_VERSION = '1.2.0';
     function applyHlsRuntimeConfig(hls, session) {
         var targetSec;
         var shouldApply;
-        var fallbackConfig;
+        var budgetBytes;
 
         if (!hls || !hls.config) return;
-
-        captureOriginalHlsDefaults(window.Hls);
 
         try {
             shouldApply = shouldUseBufferingForPlayData(session && session.playData);
 
             if (!shouldApply) {
-                fallbackConfig = hls.__advancedBufferRuntimeConfig || state.defaultHlsDefaultsBeforeApply || state.originalHlsDefaults;
-                writeHlsBufferConfig(hls.config, fallbackConfig);
+                restoreHlsRuntimeConfig(hls);
                 return;
             }
 
             if (!hls.__advancedBufferRuntimeConfig) {
-                hls.__advancedBufferRuntimeConfig = state.defaultHlsDefaultsBeforeApply || readHlsBufferConfig(hls.config);
+                hls.__advancedBufferRuntimeConfig = readHlsBufferConfig(hls.config);
             }
 
             targetSec = getEffectiveHlsTargetSec(session);
+            budgetBytes = session.bufferBudgetBytes;
 
             hls.config.maxBufferLength = targetSec;
             hls.config.maxMaxBufferLength = targetSec;
-            hls.config.maxBufferSize = getBufferSizeBytesForTarget(targetSec);
+            hls.config.maxBufferSize = budgetBytes;
             hls.config.backBufferLength = BACK_BUFFER_KEEP_SEC;
             hls.config.liveBackBufferLength = BACK_BUFFER_KEEP_SEC;
             hls.config.lowLatencyMode = false;
+            hls.__advancedBufferAppliedConfig = readHlsBufferConfig(hls.config);
         } catch (e) {
             warn('failed to apply HLS runtime config', e);
         }
@@ -563,12 +554,11 @@ var PLUGIN_VERSION = '1.2.0';
         Lampa.PlayerVideo.listener.follow('error', function (e) {
             var text;
 
-            text = String(e.error || '');
-
             if (!isPluginEnabled()) return;
             if (!e || e.fatal) return;
+            text = String(e.error || '');
 
-            if (text.indexOf('bufferFullError') >= 0 || text.indexOf('bufferAppendingError') >= 0) {
+            if (text.indexOf('bufferFullError') >= 0) {
                 setTimeout(function () {
                     try {
                         $('.player-info__error').addClass('hide').text('');
@@ -582,25 +572,20 @@ var PLUGIN_VERSION = '1.2.0';
         state.errorCleanerBound = true;
     }
 
-    // Патчим только attachMedia/loadSource/destroy у Hls.
-    // Конструктор Hls НЕ трогаем, чтобы избежать рекурсии.
+    // Lampa хранит экземпляр hls.js внутри модуля. Оборачиваем только
+    // attachMedia/destroy, не меняя DefaultConfig и не трогая parser-инстансы.
     function ensureHlsPatched(playData) {
         var OriginalHls;
         var originalAttachMedia;
-        var originalLoadSource;
         var originalDestroy;
 
-        if (state.hlsPatched) {
-            applyDefaultHlsConfig(window.Hls, playData);
-            return true;
-        }
         if (typeof window.Hls === 'undefined') return false;
 
         OriginalHls = window.Hls;
 
-        captureOriginalHlsDefaults(OriginalHls);
+        if (state.hlsPatched && state.patchedHlsCtor === OriginalHls) return true;
 
-        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferAttachPatched) {
+        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferAttachPatchedV130 && typeof OriginalHls.prototype.attachMedia === 'function') {
             originalAttachMedia = OriginalHls.prototype.attachMedia;
 
             OriginalHls.prototype.attachMedia = function (media) {
@@ -611,11 +596,9 @@ var PLUGIN_VERSION = '1.2.0';
                         media.__advancedBufferHls = this;
                     }
 
-                    window.__advancedBufferLastHls = this;
-                    state.lastHls = this;
-
-                    if (state.currentSession) {
-                        state.currentSession.video = media || state.currentSession.video;
+                    if (state.currentSession && media &&
+                        (!state.currentSession.video || state.currentSession.video === media)) {
+                        state.currentSession.video = media;
                         state.currentSession.hls = this;
                         bindHlsEvents(state.currentSession);
                         syncHlsPlaylistTypeFromState(state.currentSession, 'attach-media');
@@ -631,37 +614,10 @@ var PLUGIN_VERSION = '1.2.0';
                 return result;
             };
 
-            OriginalHls.prototype.__advancedBufferAttachPatched = true;
+            OriginalHls.prototype.__advancedBufferAttachPatchedV130 = true;
         }
 
-        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferLoadSourcePatched && typeof OriginalHls.prototype.loadSource === 'function') {
-            originalLoadSource = OriginalHls.prototype.loadSource;
-
-            OriginalHls.prototype.loadSource = function () {
-                try {
-                    window.__advancedBufferLastHls = this;
-                    state.lastHls = this;
-
-                    if (state.currentSession) {
-                        state.currentSession.hls = this;
-                        bindHlsEvents(state.currentSession);
-                        syncHlsPlaylistTypeFromState(state.currentSession, 'load-source');
-
-                        if (shouldUseBufferingForPlayData(state.currentSession.playData)) {
-                            applyHlsRuntimeConfig(this, state.currentSession);
-                        }
-                    }
-                } catch (e) {
-                    warn('loadSource patch failed', e);
-                }
-
-                return originalLoadSource.apply(this, arguments);
-            };
-
-            OriginalHls.prototype.__advancedBufferLoadSourcePatched = true;
-        }
-
-        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferDestroyPatched) {
+        if (OriginalHls.prototype && !OriginalHls.prototype.__advancedBufferDestroyPatchedV130 && typeof OriginalHls.prototype.destroy === 'function') {
             originalDestroy = OriginalHls.prototype.destroy;
 
             OriginalHls.prototype.destroy = function () {
@@ -671,14 +627,7 @@ var PLUGIN_VERSION = '1.2.0';
                     if (media && media.__advancedBufferHls === this) {
                         delete media.__advancedBufferHls;
                     }
-
-                    if (window.__advancedBufferLastHls === this) {
-                        window.__advancedBufferLastHls = null;
-                    }
-
-                    if (state.lastHls === this) {
-                        state.lastHls = null;
-                    }
+                    restoreHlsRuntimeConfig(this);
                 } catch (e) {
                     warn('destroy patch cleanup failed', e);
                 }
@@ -686,11 +635,11 @@ var PLUGIN_VERSION = '1.2.0';
                 return originalDestroy.apply(this, arguments);
             };
 
-            OriginalHls.prototype.__advancedBufferDestroyPatched = true;
+            OriginalHls.prototype.__advancedBufferDestroyPatchedV130 = true;
         }
 
         state.hlsPatched = true;
-        applyDefaultHlsConfig(window.Hls, playData);
+        state.patchedHlsCtor = OriginalHls;
         log('Hls patched successfully');
         return true;
     }
@@ -714,28 +663,17 @@ var PLUGIN_VERSION = '1.2.0';
 
     // Ищем hls.js, привязанный к активному video.
     function getCurrentHls(video) {
-        var candidates = [];
-        var i;
+        var candidate;
+        var media;
 
-        if (video && video.__advancedBufferHls) candidates.push(video.__advancedBufferHls);
-        if (window.__advancedBufferLastHls) candidates.push(window.__advancedBufferLastHls);
-        if (state.lastHls) candidates.push(state.lastHls);
-        if (window.hls) candidates.push(window.hls);
+        if (!video || !video.__advancedBufferHls) return null;
 
-        for (i = 0; i < candidates.length; i++) {
-            var candidate = candidates[i];
-            var media;
+        candidate = video.__advancedBufferHls;
+        if (!candidate || typeof candidate.startLoad !== 'function') return null;
 
-            if (!candidate || typeof candidate.startLoad !== 'function') continue;
+        media = candidate.media || candidate._media || null;
 
-            media = candidate.media || candidate._media || null;
-
-            if (!video || !media || media === video) {
-                return candidate;
-            }
-        }
-
-        return null;
+        return media === video ? candidate : null;
     }
 
     // Приводим нативный video к максимально "буферизующему" режиму.
@@ -790,14 +728,14 @@ var PLUGIN_VERSION = '1.2.0';
                 handlers: null,
                 watchdog: null,
                 destroyed: false,
-                targetSec: getInitialTargetSec(),
+                bufferBudgetBytes: getInitialBufferBudgetBytes(),
+                maxObservedBitrateBps: 0,
+                targetSec: MIN_TARGET_SEC,
                 lastStartLoadAt: 0,
                 lastProbeAt: 0,
                 lastBufferErrorAt: 0,
                 backBufferFlushPostpones: 0,
                 backBufferFlushTargetSec: 0,
-                lastBackBufferFlushAt: 0,
-                lastBackBufferFlushEndOffset: 0,
                 observedMaxAhead: 0,
                 lastBufferInfo: { ahead: 0, end: 0 },
                 predictorLastAt: 0,
@@ -809,12 +747,12 @@ var PLUGIN_VERSION = '1.2.0';
                 predictorLastActionAt: 0,
                 stallSignalCount: 0,
                 lastStallSignalAt: 0,
-                limitLearnedThisSession: false,
                 hlsBound: null,
                 hlsHandlers: null,
                 bound: false,
                 boundVideo: null,
                 lastStablePlaybackAt: 0,
+                lastPlaybackProgressAt: 0,
                 nativeKickInProgress: false,
                 nativeKickReturnTo: null,
                 nativeKickHadOwnRewind: false,
@@ -828,10 +766,10 @@ var PLUGIN_VERSION = '1.2.0';
                 lastHlsBufferEnd: 0,
                 lastHlsBufferGrowthAt: 0,
                 lastHlsSoftRestartAt: 0,
-                lastHlsCeilingExpandAt: 0,
                 hlsKeeperStallCount: 0,
                 hlsLevelCapBeforeKeeper: null,
                 hlsLevelCapApplied: false,
+                hlsLevelCapAppliedValue: null,
                 hlsLevelProgressCount: 0
             };
         }
@@ -935,15 +873,16 @@ var PLUGIN_VERSION = '1.2.0';
 
     function markStablePlayback(session) {
         var video;
+        var now;
 
         if (!session) return;
 
         video = session.video;
         if (video && (video.paused || video.seeking || video.ended)) return;
 
-        if (!session.lastStablePlaybackAt) {
-            session.lastStablePlaybackAt = Date.now();
-        }
+        now = Date.now();
+        if (!session.lastStablePlaybackAt) session.lastStablePlaybackAt = now;
+        session.lastPlaybackProgressAt = now;
     }
 
     function collectHlsDetailsCandidates(hls) {
@@ -1022,37 +961,6 @@ var PLUGIN_VERSION = '1.2.0';
         }
 
         return false;
-    }
-
-    function maybeExpandHlsCeiling(session, info, reason) {
-        var now = Date.now();
-        var effectiveTarget;
-        var preferredTarget;
-        var nextTarget;
-
-        if (!session || !session.hls || !info || !isFinite(info.ahead)) return false;
-        if (!shouldUseBufferingForPlayData(session.playData)) return false;
-
-        effectiveTarget = getEffectiveHlsTargetSec(session);
-        preferredTarget = getPreferredHlsFillTargetSec(session);
-
-        if (effectiveTarget >= preferredTarget - HLS_CEILING_EXPAND_MARGIN_SEC) return false;
-        if (info.ahead < Math.max(0, effectiveTarget - HLS_CEILING_EXPAND_MARGIN_SEC)) return false;
-        if (now - session.lastHlsCeilingExpandAt < HLS_CEILING_EXPAND_INTERVAL_MS) return false;
-        if (session.lastBufferErrorAt && now - session.lastBufferErrorAt < 15000) return false;
-
-        session.lastHlsCeilingExpandAt = now;
-
-        nextTarget = roundToSafeStep(Math.min(preferredTarget, Math.max(session.targetSec || MIN_TARGET_SEC, effectiveTarget) + PROBE_STEP_SEC));
-
-        if (nextTarget <= effectiveTarget) return false;
-
-        session.targetSec = nextTarget;
-        session.lastProbeAt = now;
-        applyHlsRuntimeConfig(session.hls, session);
-
-        log('hls target expanded after reaching short ceiling, reason =', reason || 'unknown', 'target =', session.targetSec);
-        return true;
     }
 
     // Для обычного video браузер сам решает, сколько качать вперёд.
@@ -1248,9 +1156,6 @@ var PLUGIN_VERSION = '1.2.0';
                 endOffset: endOffset
             });
 
-            session.lastBackBufferFlushAt = Date.now();
-            session.lastBackBufferFlushEndOffset = endOffset;
-
             result.flushed = true;
             result.endOffset = endOffset;
         } catch (e) {
@@ -1389,6 +1294,7 @@ var PLUGIN_VERSION = '1.2.0';
             }
 
             session.hlsLevelCapApplied = true;
+            session.hlsLevelCapAppliedValue = newCap;
             session.hlsLevelProgressCount = 0;
             log('hls keeper lowered level cap, reason =', reason || 'keeper', 'cap =', newCap);
         } catch (e) {
@@ -1396,27 +1302,36 @@ var PLUGIN_VERSION = '1.2.0';
         }
     }
 
-    function maybeRestoreHlsLevelAfterProgress(session, reason) {
+    function restoreHlsLevelCap(session, reason, force) {
         var hls;
         var previousCap;
 
         if (!session || !session.hls || !session.hlsLevelCapApplied) return;
 
-        session.hlsLevelProgressCount = Math.min(20, (session.hlsLevelProgressCount || 0) + 1);
-        if (session.hlsLevelProgressCount < HLS_KEEPER_LEVEL_RESTORE_PROGRESS_COUNT) return;
-
         hls = session.hls;
         previousCap = session.hlsLevelCapBeforeKeeper;
 
         try {
-            hls.autoLevelCapping = previousCap === null || previousCap === undefined ? -1 : previousCap;
+            if (force || toNumber(hls.autoLevelCapping, -1) === session.hlsLevelCapAppliedValue) {
+                hls.autoLevelCapping = previousCap === null || previousCap === undefined ? -1 : previousCap;
+            }
             session.hlsLevelCapApplied = false;
             session.hlsLevelCapBeforeKeeper = null;
+            session.hlsLevelCapAppliedValue = null;
             session.hlsLevelProgressCount = 0;
             log('hls keeper restored level cap, reason =', reason || 'progress');
         } catch (e) {
             warn('failed to restore hls level cap', e);
         }
+    }
+
+    function maybeRestoreHlsLevelAfterProgress(session, reason) {
+        if (!session || !session.hlsLevelCapApplied) return;
+
+        session.hlsLevelProgressCount = Math.min(20, (session.hlsLevelProgressCount || 0) + 1);
+        if (session.hlsLevelProgressCount < HLS_KEEPER_LEVEL_RESTORE_PROGRESS_COUNT) return;
+
+        restoreHlsLevelCap(session, reason);
     }
 
     function keepHlsBufferFilling(session, info, reason) {
@@ -1469,13 +1384,14 @@ var PLUGIN_VERSION = '1.2.0';
         }
     }
 
-    // Когда устройство упёрлось в bufferFullError, вычисляем безопасный предел и запоминаем его.
+    // Когда MSE упёрся в bufferFullError, вычисляем безопасный бюджет в байтах.
     function learnDeviceLimit(session, reason) {
         var info;
         var observed;
         var learned;
         var stored;
         var flushInfo;
+        var bitrate;
 
         if (!session || session.destroyed || !session.video) return;
         if (!shouldUseBufferingForPlayData(session.playData)) return;
@@ -1493,23 +1409,27 @@ var PLUGIN_VERSION = '1.2.0';
 
         if (observed <= 0) return;
 
-        learned = roundToSafeStep(Math.max(MIN_TARGET_SEC, observed - SAFE_MARGIN_AFTER_ERROR_SEC));
-        stored = getLearnedLimitSec();
+        bitrate = getHlsBitrateBps(session);
+        learned = Math.min(
+            session.bufferBudgetBytes,
+            clampBufferBudgetBytes(Math.round(Math.max(MIN_TARGET_SEC, observed - SAFE_MARGIN_AFTER_ERROR_SEC) * bitrate / 8))
+        );
+        stored = getLearnedBufferBudgetBytes();
 
-        session.targetSec = learned;
+        session.bufferBudgetBytes = learned;
+        refreshHlsTargetSec(session);
         session.backBufferFlushPostpones = 0;
         session.backBufferFlushTargetSec = 0;
-        session.limitLearnedThisSession = true;
         session.lastBufferErrorAt = Date.now();
 
-        if (!stored || Math.abs(stored - learned) >= 10 || learned < stored) {
-            saveLearnedLimitSec(learned);
+        if (!stored || Math.abs(stored - learned) >= PROBE_STEP_BYTES / 2 || learned < stored) {
+            saveLearnedBufferBudgetBytes(learned);
         }
 
         applyHlsRuntimeConfig(session.hls, session);
         if (!flushInfo.flushed) flushBackBuffer(session);
 
-        log('learned device buffer limit =', learned, 'sec, reason =', reason);
+        log('learned device buffer budget =', Math.round(learned / MEBIBYTE), 'MiB, target =', session.targetSec, 'sec, reason =', reason);
     }
 
     function markStallSignal(session, reason) {
@@ -1592,41 +1512,47 @@ var PLUGIN_VERSION = '1.2.0';
         session.predictorLastCurrent = current;
     }
 
-    // Если устройство стабильно выдерживает текущий target, пробуем поднять его чуть выше.
+    // Если устройство стабильно выдерживает текущий бюджет, пробуем добавить ещё памяти.
     function maybeProbeHigherLimit(session) {
         var now;
         var stored;
         var proposed;
+        var targetSec;
 
         if (!session || session.destroyed || !session.hls) return;
         if (!shouldUseBufferingForPlayData(session.playData)) return;
 
         now = Date.now();
+        targetSec = getEffectiveHlsTargetSec(session);
 
-        if (session.lastBufferInfo.ahead < session.targetSec - PROBE_MARGIN_SEC) return;
+        if (!session.lastStablePlaybackAt || now - session.lastStablePlaybackAt < 15000) return;
+        if (!session.lastPlaybackProgressAt || now - session.lastPlaybackProgressAt > 4000) return;
+        if (session.lastBufferInfo.ahead < targetSec - PROBE_MARGIN_SEC) return;
         if (now - session.lastProbeAt < 15000) return;
         if (now - session.lastBufferErrorAt < 20000) return;
         if (session.predictorHoldProbeUntil && now < session.predictorHoldProbeUntil) return;
-        if (session.targetSec >= ABSOLUTE_MAX_SEC) return;
+        if (targetSec >= ABSOLUTE_MAX_SEC || session.bufferBudgetBytes >= MAX_BUFFER_BUDGET_BYTES) return;
 
-        // Если текущее значение уже устойчиво держится, сохраняем его как рабочий предел.
-        stored = getLearnedLimitSec();
+        // Сохраняем только уже доказанно устойчивый бюджет; следующую ступень
+        // сначала проверяем в текущей сессии.
+        stored = getLearnedBufferBudgetBytes();
 
-        if (session.targetSec > stored && session.lastBufferInfo.ahead >= session.targetSec - PROBE_MARGIN_SEC) {
-            saveLearnedLimitSec(session.targetSec);
+        if (session.bufferBudgetBytes > stored && session.lastBufferInfo.ahead >= targetSec - PROBE_MARGIN_SEC) {
+            saveLearnedBufferBudgetBytes(session.bufferBudgetBytes);
         }
 
-        proposed = roundToSafeStep(Math.min(ABSOLUTE_MAX_SEC, session.targetSec + PROBE_STEP_SEC));
+        proposed = clampBufferBudgetBytes(session.bufferBudgetBytes + PROBE_STEP_BYTES);
 
-        if (proposed <= session.targetSec) return;
+        if (proposed <= session.bufferBudgetBytes) return;
 
-        session.targetSec = proposed;
+        session.bufferBudgetBytes = proposed;
+        refreshHlsTargetSec(session);
         session.backBufferFlushPostpones = 0;
         session.backBufferFlushTargetSec = 0;
         session.lastProbeAt = now;
 
         applyHlsRuntimeConfig(session.hls, session);
-        log('probing higher device limit ->', proposed, 'sec');
+        log('probing higher device budget ->', Math.round(proposed / MEBIBYTE), 'MiB, target =', session.targetSec, 'sec');
     }
 
     function markSessionLiveLike(session, reason) {
@@ -1639,8 +1565,6 @@ var PLUGIN_VERSION = '1.2.0';
         session.lastBufferInfo = { ahead: 0, end: 0 };
         session.backBufferFlushPostpones = 0;
         session.backBufferFlushTargetSec = 0;
-
-        if (marked) applyDefaultHlsConfig(window.Hls, session.playData);
 
         if (session.hls) {
             applyHlsRuntimeConfig(session.hls, session);
@@ -1655,8 +1579,6 @@ var PLUGIN_VERSION = '1.2.0';
         marked = markPlayDataVodLike(session.playData, reason);
 
         if (shouldUseBufferingForPlayData(session.playData)) {
-            if (marked) applyDefaultHlsConfig(window.Hls, session.playData);
-
             if (session.hls) {
                 applyHlsRuntimeConfig(session.hls, session);
                 if (marked) primeHlsBuffer(session, reason || 'vod-detected');
@@ -1732,7 +1654,7 @@ var PLUGIN_VERSION = '1.2.0';
                     return;
                 }
 
-                if (data.details === HlsCtor.ErrorDetails.BUFFER_FULL_ERROR || data.details === HlsCtor.ErrorDetails.BUFFER_APPENDING_ERROR) {
+                if (data.details === HlsCtor.ErrorDetails.BUFFER_FULL_ERROR) {
                     learnDeviceLimit(session, data.details);
                     return;
                 }
@@ -1819,8 +1741,6 @@ var PLUGIN_VERSION = '1.2.0';
         if (info.ahead > session.observedMaxAhead) {
             session.observedMaxAhead = info.ahead;
         }
-
-        maybeExpandHlsCeiling(session, info, reason || 'evaluate');
 
         keepHlsBufferFilling(session, info, reason || 'evaluate');
 
@@ -1937,13 +1857,17 @@ var PLUGIN_VERSION = '1.2.0';
     }
 
     // Полностью удаляем текущую сессию.
-    function destroyCurrentSession() {
+    function destroyCurrentSession(restoreRuntime) {
         var session = state.currentSession;
 
         if (!session) return;
 
         session.destroyed = true;
         clearSessionAsyncState(session);
+        if (restoreRuntime !== false) {
+            restoreHlsLevelCap(session, 'session-destroy', restoreRuntime === true);
+            restoreHlsRuntimeConfig(session.hls, restoreRuntime === true);
+        }
         unbindHlsEvents(session);
         unbindSessionVideoEvents(session);
 
@@ -2017,33 +1941,7 @@ var PLUGIN_VERSION = '1.2.0';
 
         evaluateSession('player-ready');
 
-        log('session started, initial target =', session.targetSec, 'sec');
-    }
-
-    // Применяем новые настройки к активной сессии.
-    function syncCurrentSession(reason) {
-        var session = state.currentSession;
-
-        applyDefaultHlsConfig(window.Hls, session && session.playData);
-
-        if (!session || session.destroyed) return;
-        if (!isAnyFeatureEnabled()) return;
-
-        session.hls = getCurrentHls(session.video || getCurrentVideo());
-
-        if (session.hls) {
-            bindHlsEvents(session);
-            syncHlsPlaylistTypeFromState(session, reason || 'sync-hls-state');
-
-            if (shouldUseBufferingForPlayData(session.playData)) {
-                applyHlsRuntimeConfig(session.hls, session);
-                primeHlsBuffer(session, reason || 'sync');
-            } else {
-                applyHlsRuntimeConfig(session.hls, session);
-            }
-        }
-
-        evaluateSession(reason || 'sync');
+        log('session started, budget =', Math.round(session.bufferBudgetBytes / MEBIBYTE), 'MiB, target =', session.targetSec, 'sec');
     }
 
     // Основной запуск плагина.
@@ -2052,7 +1950,6 @@ var PLUGIN_VERSION = '1.2.0';
         registerSettings();
         ensureHlsPatched();
         bindBufferErrorCleaner();
-        applyDefaultHlsConfig(window.Hls, null);
 
         // До создания Hls просим Lampa использовать именно hls.js для VOD m3u8,
         // иначе нативный HLS браузера/вебвью не даст контролировать буфер.
@@ -2098,5 +1995,5 @@ var PLUGIN_VERSION = '1.2.0';
         });
     }
 
-console.log('[Advanced Buffer Control] v1.2.0: file end');
+console.log('[Advanced Buffer Control] v1.3.0: file end');
 }());
