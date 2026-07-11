@@ -1,6 +1,6 @@
 # Advanced Buffer Control
 
-Version: **1.2.0**
+Version: **1.3.0**
 
 ## Русский
 
@@ -12,12 +12,12 @@ Version: **1.2.0**
 
 - Добавляет один переключатель в **Настройки -> Плеер**.
 - Для `.m3u8`, который не выглядит как live/IPTV, просит Lampa использовать `hls.js`, если он доступен.
-- Для HLS VOD увеличивает целевой буфер, стартуя с 480 секунд.
+- Для HLS VOD рассчитывает целевой буфер из безопасного бюджета памяти и битрейта текущего качества.
 - Постоянно поддерживает HLS-загрузку до текущего target во время воспроизведения и на паузе.
-- Автоматически учит безопасный предел устройства по `bufferFullError` / `bufferAppendingError`.
-- Запоминает найденный HLS-лимит в `Lampa.Storage` и использует его в следующих сессиях.
+- Автоматически учит безопасный бюджет устройства только по `bufferFullError`.
+- Запоминает найденный бюджет в байтах в `Lampa.Storage` и использует его в следующих сессиях.
 - Держит back-buffer коротким: около 20 секунд позади текущей позиции.
-- При стабильной работе постепенно пробует поднять лимит выше.
+- При стабильной работе постепенно пробует поднять бюджет выше, сначала проверяя новую ступень в текущей сессии.
 - Заранее реагирует на риск остановки: учитывает прирост буфера, расход буфера, `waiting` / `stalled` / `suspend` и временно блокирует повышение target.
 - Для обычного `video` включает `preload="auto"` и аккуратно подталкивает загрузку коротким seek только при низком буфере.
 
@@ -31,14 +31,16 @@ Version: **1.2.0**
 - либо `hls.js` сообщает, что плейлист не live;
 - либо у video появляется конечная длительность.
 
-Если поток помечен как live/IPTV или позже оказался live, плагин отключает расширенное буферизование и возвращает обычные настройки `hls.js`.
+Если поток помечен как live/IPTV или позже оказался live, плагин отключает расширенное буферизование и возвращает настройки активного экземпляра `hls.js`. Поле `need_check_live_stream` само по себе не считается признаком live: окончательное решение принимает плейлист.
 
-Пределы HLS-буфера:
+Бюджет HLS-буфера:
 
-- стартовый target: 480 секунд;
-- минимальный обученный target: 15 секунд;
-- максимальный target: 900 секунд;
-- шаг повышения после стабильной работы: 30 секунд.
+- начальный бюджет: 64 MiB;
+- допустимый диапазон: 32–512 MiB;
+- цель в секундах вычисляется из бюджета и наиболее высокого замеченного битрейта, от 15 до 900 секунд;
+- шаг повышения после стабильной работы: 16 MiB.
+
+Так 4K-поток не наследует опасную цель в сотни секунд от низкобитрейтного видео. Значение `maxBufferLength` всегда ограничено рассчитанным бюджетом, потому что hls.js может стремиться к этому значению даже сверх `maxBufferSize`.
 
 ### Обычное video-воспроизведение
 
@@ -63,7 +65,7 @@ Version: **1.2.0**
 
 ### Настройки
 
-- **Умное заполнение буфера** — включает или выключает адаптивное заполнение буфера.
+- **Умное заполнение буфера** — включает или выключает адаптивное заполнение буфера. Изменение применяется к уже открытой сессии: при выключении исходные параметры активного hls.js восстанавливаются, при включении плагин подключается к текущему видео.
 
 Умное заполнение буфера включено по умолчанию.
 
@@ -93,12 +95,12 @@ The plugin does not add an external segment cache and does not replace the `hls.
 
 - Adds one switch to **Settings -> Player**.
 - Asks Lampa to use `hls.js` for `.m3u8` streams that do not look like live/IPTV, when available.
-- Increases the HLS VOD target buffer, starting from 480 seconds.
+- Calculates the HLS VOD target from a safe memory budget and the current rendition bitrate.
 - Keeps HLS loading toward the current target during playback and while paused.
-- Learns the safe device limit from `bufferFullError` / `bufferAppendingError`.
-- Stores the learned HLS limit in `Lampa.Storage` and reuses it in later sessions.
+- Learns a safe device budget only from `bufferFullError`.
+- Stores the learned byte budget in `Lampa.Storage` and reuses it in later sessions.
 - Keeps the back-buffer short: about 20 seconds behind the current position.
-- Gradually probes higher limits after stable playback.
+- Gradually probes a higher budget after stable playback, validating a new step in the current session first.
 - Predicts stalls by watching buffer growth, buffer drain and `waiting` / `stalled` / `suspend`, then temporarily blocks target probing.
 - For regular `video`, enables `preload="auto"` and gently nudges loading with a short seek only when the buffer is low.
 
@@ -112,14 +114,16 @@ Large HLS buffering is enabled only after VOD is confirmed:
 - or `hls.js` reports that the playlist is not live;
 - or the video gets a finite duration.
 
-If the stream is marked as live/IPTV or later turns out to be live, the plugin disables extended buffering and restores the normal `hls.js` settings.
+If the stream is marked as live/IPTV or later turns out to be live, the plugin disables extended buffering and restores the active `hls.js` instance settings. `need_check_live_stream` alone is not considered a live flag; the playlist makes the final decision.
 
-HLS buffer limits:
+HLS buffer budget:
 
-- initial target: 480 seconds;
-- minimum learned target: 15 seconds;
-- maximum target: 900 seconds;
-- stable-playback probe step: 30 seconds.
+- initial budget: 64 MiB;
+- allowed range: 32–512 MiB;
+- the seconds target is derived from the budget and the highest observed bitrate, from 15 to 900 seconds;
+- stable-playback probe step: 16 MiB.
+
+This prevents a high-bitrate 4K stream from inheriting a risky hundreds-of-seconds target from a low-bitrate video. `maxBufferLength` is always constrained by the calculated budget because hls.js may pursue it even beyond `maxBufferSize`.
 
 ### Regular Video Playback
 
@@ -144,7 +148,7 @@ HLS also has a continuous buffer keeper. It does not wait for a low-buffer state
 
 ### Settings
 
-- **Smart Buffer Fill** — enables or disables adaptive buffering.
+- **Smart Buffer Fill** — enables or disables adaptive buffering. The change applies to the current session: disabling restores the active hls.js instance settings, while enabling attaches to the current video.
 
 Smart buffering is enabled by default.
 
